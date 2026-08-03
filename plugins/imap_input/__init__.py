@@ -106,6 +106,80 @@ class ImapInput(InputPlugin):
         # is a long-standing IMAP wart rather than a server bug.
         return sorted(uid for uid in (int(item) for item in found) if uid > last_uid)
 
+    def _evaluate(self, *, client: Any, uids: Sequence[int], emit_now: bool) -> list[ObservedEvent]:
+        fetched = client.fetch(list(uids), ["ENVELOPE", "INTERNALDATE"])
+        events: list[ObservedEvent] = []
+
+        for uid in sorted(fetched):
+            envelope = fetched[uid].get(b"ENVELOPE")
+            if envelope is None:
+                continue
+            sender = _sender_of(envelope)
+            subject = decode_subject(_decode(envelope.subject))
+            occurred_at = _message_date(
+                envelope=envelope,
+                internal_date=fetched[uid].get(b"INTERNALDATE"),
+                fallback=self.context.clock.now(),
+            )
+
+            result = self._settings.criteria.evaluate(sender=sender, subject=subject)
+            self._log_evaluation(uid=uid, sender=sender, subject=subject, result=result)
+            if not result.matched or self._settings.dry_run:
+                continue
+
+            event = ObservedEvent(
+                occurred_at=occurred_at,
+                metadata=clamp_metadata(
+                    {
+                        "sender": sender,
+                        "subject": subject,
+                        "date": occurred_at.isoformat(),
+                        "folder": self._settings.folder,
+                        "uid": str(uid),
+                    }
+                ),
+            )
+            events.append(event)
+            if emit_now:
+                self.emit(event)
+
+        return events
+
+    def _log_evaluation(self, *, uid: int, sender: str, subject: str, result: MatchResult) -> None:
+        if self._settings.dry_run:
+            verdict = "would emit" if result.matched else "would ignore"
+            self._log.info(
+                "dry run: %s UID %d from %s -- %s",
+                verdict,
+                uid,
+                sender,
+                result.reason,
+                extra={
+                    "instance": self.context.instance_name,
+                    "uid": uid,
+                    "sender": sender,
+                    "subject": subject,
+                    "would_emit": result.matched,
+                },
+            )
+            return
+
+        if result.matched:
+            self._log.info(
+                "matched UID %d from %s: %s",
+                uid,
+                sender,
+                subject,
+                extra={"instance": self.context.instance_name, "uid": uid, "sender": sender},
+            )
+        else:
+            self._log.debug(
+                "ignored UID %d: %s",
+                uid,
+                result.reason,
+                extra={"instance": self.context.instance_name, "uid": uid},
+            )
+
     # -- the cursor -----------------------------------------------------------
 
     def _reconcile_uidvalidity(self, *, client: Any, uidvalidity: int) -> None:
@@ -170,6 +244,36 @@ def _highest_uid(client: Any) -> int:
     if not found:
         return 0
     return max(int(uid) for uid in found)
+
+
+def _decode(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _sender_of(envelope: Any) -> str:
+    addresses = getattr(envelope, "from_", None) or ()
+    for address in addresses:
+        mailbox = _decode(address.mailbox) or ""
+        host = _decode(address.host) or ""
+        if mailbox and host:
+            return f"{mailbox}@{host}".lower()
+    return sender_address(_decode(getattr(envelope, "sender", None)))
+
+
+def _message_date(
+    *, envelope: Any, internal_date: object, fallback: datetime.datetime
+) -> datetime.datetime:
+    """The time the message says it was sent, preferred over when we saw it."""
+    for candidate in (getattr(envelope, "date", None), internal_date):
+        if isinstance(candidate, datetime.datetime):
+            if candidate.tzinfo is None:
+                return candidate.replace(tzinfo=datetime.UTC)
+            return candidate.astimezone(datetime.UTC)
+    return fallback
 
 
 def _close_quietly(client: Any) -> None:
