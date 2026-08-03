@@ -248,6 +248,23 @@ class PagerDutyOutput(OutputPlugin):
 
         return RemoteState(belief=RemoteBelief.CLEARED, cleared_at=resolved_at)
 
+    def poll_once(self) -> None:
+        """One polling pass: read incident status, and unlatch if it resolved.
+
+        An unlatch against already-cleared state is a no-op in the core, so a
+        poll that observes a clear this daemon itself caused does no harm. That
+        is the loop-prevention contract, and it is why this can be unconditional
+        rather than trying to remember which clears were ours.
+        """
+        state = self.query()
+        if state.belief is not RemoteBelief.CLEARED:
+            return
+        self.request_unlatch("PagerDuty incident resolved")
+
+    def _poll_loop(self) -> None:
+        while not self._stop.wait(timeout=self._poll_seconds):
+            self.poll_once()
+
     def _fetch_incidents(self) -> list[dict[str, object]]:
         query = urlencode(
             [("incident_key", self._dedup_key), ("limit", "10"), ("sort_by", "created_at:desc")]
