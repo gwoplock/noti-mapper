@@ -33,6 +33,7 @@ from pathlib import Path
 from noti_mapper.clock import from_iso, to_iso
 
 SCHEMA_VERSION: int = 1
+LAST_SEEN_KEY: str = "last_seen_at"
 DEFAULT_STATE_DIRECTORY: Path = Path("/var/lib/noti-mapper")
 DATABASE_FILENAME: str = "state.db"
 
@@ -118,6 +119,12 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         instance_name   TEXT,
         rule_name       TEXT,
         detail          TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    """
+    CREATE TABLE daemon_state (
+        key             TEXT PRIMARY KEY,
+        value           TEXT NOT NULL
     )
     """,
     "CREATE INDEX event_log_at ON event_log(at)",
@@ -692,6 +699,16 @@ class Store:
             ),
         )
 
+    def pending_push(self, instance_name: str) -> PendingPush | None:
+        row = (
+            self._database.connection()
+            .execute("SELECT * FROM pending_pushes WHERE instance_name = ?", (instance_name,))
+            .fetchone()
+        )
+        if row is None:
+            return None
+        return _pending_push_from_row(row)
+
     def delete_pending_push(self, instance_name: str) -> None:
         self._database.connection().execute(
             "DELETE FROM pending_pushes WHERE instance_name = ?", (instance_name,)
@@ -732,6 +749,43 @@ class Store:
         if row is None or row["soonest"] is None:
             return None
         return from_iso(str(row["soonest"]))
+
+    # -- daemon state ---------------------------------------------------------
+
+    def daemon_state(self, key: str) -> str | None:
+        """Read a daemon-wide scalar.
+
+        Only one thing lives here so far -- the last time the daemon is known
+        to have been running, which is what an input plugin's catch_up() is
+        given as its "since". It is deliberately not in the event log, because
+        nothing may depend on the event log being complete.
+        """
+        row = (
+            self._database.connection()
+            .execute("SELECT value FROM daemon_state WHERE key = ?", (key,))
+            .fetchone()
+        )
+        if row is None:
+            return None
+        return str(row["value"])
+
+    def write_daemon_state(self, *, key: str, value: str) -> None:
+        self._database.connection().execute(
+            """
+            INSERT INTO daemon_state (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+
+    def last_seen_at(self) -> datetime.datetime | None:
+        stored = self.daemon_state(LAST_SEEN_KEY)
+        if stored is None:
+            return None
+        return from_iso(stored)
+
+    def write_last_seen_at(self, moment: datetime.datetime) -> None:
+        self.write_daemon_state(key=LAST_SEEN_KEY, value=to_iso(moment))
 
     # -- health ---------------------------------------------------------------
 
