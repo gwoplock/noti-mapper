@@ -73,6 +73,14 @@ files = ["src", "tests", "plugins"]
 module = ["imapclient.*", "pyhap.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# A plugin that has to subclass an untyped library class cannot avoid an
+# untyped base. Everything the plugin itself declares is still checked; only
+# the types it inherits from the library are allowed to be Any.
+module = ["homekit_output.*"]
+disallow_any_unimported = false
+disallow_subclassing_any = false
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "plugins", "."]
