@@ -151,6 +151,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+SUBCOMMANDS: tuple[str, ...] = (
+    "run",
+    "validate",
+    "status",
+    "rename",
+    "purge",
+    "version",
+)
+
+
+def subcommand_names(parser: argparse.ArgumentParser) -> list[str]:
+    """The subcommands a parser actually accepts.
+
+    argparse exposes this only through a private attribute. Reaching for it
+    once, here, is better than every caller doing it, and it lets the man page
+    and the systemd unit be checked against the real parser rather than
+    against a list that can quietly drift away from it.
+    """
+    group = parser._subparsers  # noqa: SLF001
+    if group is None:
+        return []
+    names: list[str] = []
+    for action in group._group_actions:  # noqa: SLF001
+        choices = getattr(action, "choices", None)
+        if choices is None:
+            continue
+        names.extend(str(choice) for choice in choices)
+    return sorted(names)
+
+
 def _paths_from(arguments: argparse.Namespace) -> Paths:
     config_directory = arguments.config_dir
     if config_directory is None:
