@@ -37,6 +37,7 @@ from noti_mapper.plugin import (
     InputPlugin,
     ObservedEvent,
     OutputPlugin,
+    OutputUpdate,
     PluginHealth,
     RemoteBelief,
     RemoteState,
@@ -369,6 +370,7 @@ class Engine:
                 set_at=at,
                 trigger_count=record.trigger_count + 1,
                 last_cause=cause,
+                last_detail=summary,
             )
             self._write_latch(updated)
             self._append_event(
@@ -393,6 +395,7 @@ class Engine:
             set_at=at,
             trigger_count=record.trigger_count + 1,
             last_cause=cause,
+            last_detail=summary,
         )
         self._write_latch(updated)
         self._append_event(
@@ -583,7 +586,7 @@ class Engine:
         if not due:
             return
 
-        ready: list[tuple[str, bool]] = []
+        ready: list[tuple[str, OutputUpdate]] = []
         with self._store.database.transaction():
             for push in due:
                 if push.instance_name in self._in_flight:
@@ -600,11 +603,46 @@ class Engine:
                 )
                 if desired != push.target_value:
                     self._store.write_pending_push(replace(push, target_value=desired))
-                ready.append((push.instance_name, desired))
+                ready.append((push.instance_name, self._build_update(push.instance_name, desired)))
 
-        for instance_name, value in ready:
+        for instance_name, update in ready:
             self._in_flight.add(instance_name)
-            self._dispatcher.dispatch(instance_name=instance_name, value=value)
+            self._dispatcher.dispatch(instance_name=instance_name, update=update)
+
+    def _build_update(self, instance_name: str, desired: bool) -> OutputUpdate:
+        """Describe why an output is being driven, not just to what.
+
+        The cause and detail come from whichever of the driving rules was set
+        most recently, and the trigger count is summed across all of them, so
+        an output shared by two latched rules reports both.
+        """
+        if not desired:
+            return OutputUpdate(state=False)
+
+        driving: list[LatchRecord] = []
+        for rule in self._graph.rules_for_output(instance_name):
+            record = self._latch(rule.name)
+            if record.state:
+                driving.append(record)
+
+        if not driving:
+            return OutputUpdate(state=desired)
+
+        newest = driving[0]
+        total = 0
+        for record in driving:
+            total += record.trigger_count
+            if _is_newer(record.set_at, newest.set_at):
+                newest = record
+
+        return OutputUpdate(
+            state=True,
+            cause=newest.last_cause or "",
+            detail=newest.last_detail or "",
+            trigger_count=total,
+            rules=tuple(sorted(record.rule_name for record in driving)),
+            since=newest.set_at,
+        )
 
     # -- reload ---------------------------------------------------------------
 
@@ -955,6 +993,14 @@ class UnlatchFor:
 
     def __call__(self, cause: str) -> None:
         self.engine.submit(UnlatchRequestMessage(instance_name=self.instance_name, cause=cause))
+
+
+def _is_newer(candidate: datetime.datetime | None, current: datetime.datetime | None) -> bool:
+    if candidate is None:
+        return False
+    if current is None:
+        return True
+    return candidate > current
 
 
 def _summarize(

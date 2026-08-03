@@ -17,6 +17,7 @@ import enum
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from noti_mapper.clock import Clock
 from noti_mapper.storage import HealthStatus, PluginKeyValueStore
@@ -98,6 +99,37 @@ class RemoteState:
 
 
 @dataclass(frozen=True)
+class OutputUpdate:
+    """What an output is being asked to render.
+
+    A bare boolean is not enough. The rule semantics deliberately keep counting
+    re-triggers of an already-set latch so that an output can render "3
+    packages waiting", and the PagerDuty payload is supposed to carry the
+    subject line that caused the alert. Neither is possible if the only thing
+    crossing this boundary is True or False.
+
+    ``rules`` lists the rules currently driving this output true, which is what
+    makes the coupling visible to a user looking at an incident: an output that
+    is true because of two rules says so.
+    """
+
+    state: bool
+    cause: str = ""
+    detail: str = ""
+    trigger_count: int = 0
+    rules: tuple[str, ...] = ()
+    since: datetime.datetime | None = None
+
+    def summary(self) -> str:
+        """A one-line rendering for an alert title or a log line."""
+        if not self.state:
+            return "cleared"
+        if self.trigger_count > 1:
+            return f"{self.detail or 'latched'} ({self.trigger_count} triggers)"
+        return self.detail or "latched"
+
+
+@dataclass(frozen=True)
 class PluginHealth:
     """A plugin instance's own opinion of how it is doing."""
 
@@ -119,6 +151,21 @@ class PluginContext:
     storage: PluginKeyValueStore
     clock: Clock
     logger: logging.Logger
+    # Where a plugin may keep files that will not fit in key/value storage --
+    # HAP pairing state being the case that forces this to exist. Prefer
+    # ``storage``; use this only when a library insists on a path.
+    state_directory: Path = Path("/var/lib/noti-mapper")
+
+    def state_path(self, filename: str) -> Path:
+        """A per-instance path under the state directory, with the parent created.
+
+        Instance names may contain spaces and are not otherwise sanitized here,
+        because the name character set already excludes slashes and control
+        characters.
+        """
+        directory = self.state_directory / "plugins" / self.instance_name
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / filename
 
 
 EmitCallback = Callable[[ObservedEvent], None]
@@ -225,8 +272,8 @@ class OutputPlugin(abc.ABC):
         """Shut down. Must be safe to call whether or not start() succeeded."""
 
     @abc.abstractmethod
-    def apply(self, state: bool) -> None:
-        """Drive the remote to ``state``.
+    def apply(self, update: OutputUpdate) -> None:
+        """Drive the remote to ``update.state``.
 
         Called from a dispatcher thread, never the core thread, so blocking on
         the network here is fine. Raise :class:`PluginError` on failure; the

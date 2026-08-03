@@ -9,6 +9,7 @@ import logging
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from noti_mapper.clock import Clock, ManualClock
 from noti_mapper.dispatcher import Dispatcher
@@ -18,6 +19,7 @@ from noti_mapper.plugin import (
     InputPlugin,
     ObservedEvent,
     OutputPlugin,
+    OutputUpdate,
     PluginContext,
     PluginError,
     PluginHealth,
@@ -34,6 +36,7 @@ def make_context(
     database: Database,
     settings: Mapping[str, object] | None = None,
     clock: Clock | None = None,
+    state_directory: Path | None = None,
 ) -> PluginContext:
     return PluginContext(
         instance_name=instance_name,
@@ -41,6 +44,7 @@ def make_context(
         storage=PluginKeyValueStore(database=database, instance_name=instance_name),
         clock=clock if clock is not None else ManualClock(),
         logger=logging.getLogger(f"test.plugin.{instance_name}"),
+        state_directory=(state_directory if state_directory is not None else database.path.parent),
     )
 
 
@@ -113,6 +117,7 @@ class FakeOutput(OutputPlugin):
         self._behaviour = FakeOutputBehaviour()
         self._lock = threading.Lock()
         self.applied: list[bool] = []
+        self.updates: list[OutputUpdate] = []
         self.started = False
         self.stopped = False
         self.query_calls = 0
@@ -127,14 +132,15 @@ class FakeOutput(OutputPlugin):
     def stop(self) -> None:
         self.stopped = True
 
-    def apply(self, state: bool) -> None:
+    def apply(self, update: OutputUpdate) -> None:
         with self._lock:
             if self._behaviour.apply_always_fails:
                 raise PluginError(f"{self.context.instance_name} is unreachable")
             if self._behaviour.apply_failures > 0:
                 self._behaviour.apply_failures -= 1
                 raise PluginError(f"{self.context.instance_name} is unreachable")
-            self.applied.append(state)
+            self.applied.append(update.state)
+            self.updates.append(update)
 
     def query(self) -> RemoteState:
         with self._lock:
@@ -168,6 +174,7 @@ class InlineDispatcher(Dispatcher):
         self._outputs: dict[str, OutputPlugin] = dict(outputs)
         self._report = report
         self.dispatched: list[tuple[str, bool]] = []
+        self.last_update: OutputUpdate | None = None
         self.started = False
         self.stopped = False
 
@@ -180,31 +187,34 @@ class InlineDispatcher(Dispatcher):
     def set_outputs(self, outputs: Mapping[str, OutputPlugin]) -> None:
         self._outputs = dict(outputs)
 
-    def dispatch(self, *, instance_name: str, value: bool) -> None:
-        self.dispatched.append((instance_name, value))
+    def dispatch(self, *, instance_name: str, update: OutputUpdate) -> None:
+        self.dispatched.append((instance_name, update.state))
+        self.last_update = update
         output = self._outputs.get(instance_name)
         if output is None:
             self._report(
                 PushResultMessage(
                     instance_name=instance_name,
-                    pushed_value=value,
+                    pushed_value=update.state,
                     succeeded=False,
                     error="output instance is no longer configured",
                 )
             )
             return
         try:
-            output.apply(value)
+            output.apply(update)
         except Exception as error:
             self._report(
                 PushResultMessage(
                     instance_name=instance_name,
-                    pushed_value=value,
+                    pushed_value=update.state,
                     succeeded=False,
                     error=f"{type(error).__name__}: {error}",
                 )
             )
             return
         self._report(
-            PushResultMessage(instance_name=instance_name, pushed_value=value, succeeded=True)
+            PushResultMessage(
+                instance_name=instance_name, pushed_value=update.state, succeeded=True
+            )
         )
