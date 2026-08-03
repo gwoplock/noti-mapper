@@ -22,10 +22,15 @@ disjoint from everything the core writes.
 """
 
 import contextlib
+import datetime
+import enum
 import sqlite3
 import threading
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
+
+from noti_mapper.clock import from_iso
 
 SCHEMA_VERSION: int = 1
 DEFAULT_STATE_DIRECTORY: Path = Path("/var/lib/noti-mapper")
@@ -119,6 +124,124 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX rule_inputs_instance ON rule_inputs(instance_name)",
     "CREATE INDEX rule_outputs_instance ON rule_outputs(instance_name)",
 )
+
+
+class EventKind(enum.Enum):
+    """What a row in ``event_log`` records.
+
+    ``event_log`` is a log, not an audit trail. Nothing in the daemon may read
+    it back to make a decision; if a user truncates the table the daemon must
+    behave identically. It exists so a human can answer "why did this fire".
+    """
+
+    INPUT_EVENT = "input-event"
+    LATCH_SET = "latch-set"
+    LATCH_RETRIGGERED = "latch-retriggered"
+    LATCH_CLEARED = "latch-cleared"
+    UNLATCH_IGNORED = "unlatch-ignored"
+    OUTPUT_PUSH_SUCCEEDED = "output-push-succeeded"
+    OUTPUT_PUSH_FAILED = "output-push-failed"
+    RECONCILED = "reconciled"
+    CONFIG_LOADED = "config-loaded"
+    RULE_ORPHANED = "rule-orphaned"
+    RULE_ADOPTED = "rule-adopted"
+    RENAMED = "renamed"
+    PURGED = "purged"
+    DAEMON_STARTED = "daemon-started"
+    DAEMON_STOPPED = "daemon-stopped"
+
+
+class HealthStatus(enum.Enum):
+    """A plugin instance's own opinion of how it is doing."""
+
+    UNKNOWN = "unknown"
+    STARTING = "starting"
+    OK = "ok"
+    DEGRADED = "degraded"
+    FAILED = "failed"
+    STOPPED = "stopped"
+
+
+@dataclass(frozen=True)
+class LatchRecord:
+    """Persistent latch state for one rule."""
+
+    rule_name: str
+    state: bool
+    set_at: datetime.datetime | None
+    cleared_at: datetime.datetime | None
+    trigger_count: int
+    last_cause: str | None
+
+
+@dataclass(frozen=True)
+class RuleRecord:
+    """A rule as the database knows it, including rules config no longer defines."""
+
+    name: str
+    enabled: bool
+    orphaned: bool
+    inputs: tuple[str, ...]
+    outputs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class InstanceRecord:
+    """An instance as the database knows it."""
+
+    name: str
+    plugin: str
+    enabled: bool
+    orphaned: bool
+
+
+@dataclass(frozen=True)
+class OutputStateRecord:
+    """What the daemon last pushed to an output, and what the output confirmed."""
+
+    instance_name: str
+    last_applied: bool | None
+    last_confirmed: bool | None
+    last_sync_at: datetime.datetime | None
+
+
+@dataclass(frozen=True)
+class PendingPush:
+    """An outbound push waiting to be attempted.
+
+    Keyed on the instance, so there is at most one row per output. A push is
+    always "apply current state", never "apply the delta that failed", and
+    keying on the instance is what makes replaying a stale value structurally
+    impossible rather than merely unlikely.
+    """
+
+    instance_name: str
+    target_value: bool
+    attempt_count: int
+    next_attempt_at: datetime.datetime
+    last_error: str | None
+
+
+@dataclass(frozen=True)
+class HealthRecord:
+    """The last health report from an instance."""
+
+    instance_name: str
+    status: HealthStatus
+    detail: str
+    updated_at: datetime.datetime
+
+
+@dataclass(frozen=True)
+class EventLogEntry:
+    """One row of the rolling event log."""
+
+    identifier: int
+    at: datetime.datetime
+    kind: EventKind
+    instance_name: str | None
+    rule_name: str | None
+    detail: str
 
 
 def database_path(state_directory: Path) -> Path:
@@ -223,6 +346,22 @@ class StorageError(Exception):
     """The database cannot be used."""
 
 
+def _as_bool(value: object) -> bool:
+    return bool(value)
+
+
+def _optional_bool(value: object) -> bool | None:
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _optional_time(value: object) -> datetime.datetime | None:
+    if value is None:
+        return None
+    return from_iso(str(value))
+
+
 class Store:
     """Typed access to the daemon's persistent state.
 
@@ -317,3 +456,33 @@ class PluginKeyValueStore:
         for row in rows:
             result[str(row["key"])] = str(row["value"])
         return result
+
+
+def _latch_from_row(row: sqlite3.Row) -> LatchRecord:
+    return LatchRecord(
+        rule_name=str(row["rule_name"]),
+        state=_as_bool(row["state"]),
+        set_at=_optional_time(row["set_at"]),
+        cleared_at=_optional_time(row["cleared_at"]),
+        trigger_count=int(row["trigger_count"]),
+        last_cause=None if row["last_cause"] is None else str(row["last_cause"]),
+    )
+
+
+def _output_state_from_row(row: sqlite3.Row) -> OutputStateRecord:
+    return OutputStateRecord(
+        instance_name=str(row["instance_name"]),
+        last_applied=_optional_bool(row["last_applied"]),
+        last_confirmed=_optional_bool(row["last_confirmed"]),
+        last_sync_at=_optional_time(row["last_sync_at"]),
+    )
+
+
+def _pending_push_from_row(row: sqlite3.Row) -> PendingPush:
+    return PendingPush(
+        instance_name=str(row["instance_name"]),
+        target_value=_as_bool(row["target_value"]),
+        attempt_count=int(row["attempt_count"]),
+        next_attempt_at=from_iso(str(row["next_attempt_at"])),
+        last_error=None if row["last_error"] is None else str(row["last_error"]),
+    )
