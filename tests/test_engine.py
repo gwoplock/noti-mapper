@@ -764,3 +764,64 @@ def test_reload_leaves_unrelated_latches_alone(tmp_path: Path) -> None:
         assert harness.applied("Lamp") == [True]
         assert harness.applied("Pager") == [True]
         assert EventKind.CONFIG_LOADED in harness.event_kinds()
+
+
+# -- what an output is told ---------------------------------------------------
+
+
+def test_an_output_is_told_why_it_is_being_driven(simple: Harness) -> None:
+    simple.fire("Mail", metadata={"subject": "Delivered: box"})
+
+    update = simple.outputs["Lamp"].updates[-1]
+    assert update.state is True
+    assert update.cause == "Mail"
+    assert "Delivered: box" in update.detail
+    assert update.trigger_count == 1
+    assert update.rules == ("R",)
+    assert update.since == START
+
+
+def test_a_retriggered_latch_reaches_the_output_on_the_next_push(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp", "Pager"])}):
+        harness.outputs["Pager"].configure(FakeOutputBehaviour(apply_always_fails=True))
+        harness.fire("Mail", metadata={"n": "1"})
+        harness.fire("Mail", metadata={"n": "2"})
+        harness.fire("Mail", metadata={"n": "3"})
+
+        harness.outputs["Pager"].configure(FakeOutputBehaviour())
+        harness.clock.advance(3600)
+        harness.engine.drain()
+
+        update = harness.outputs["Pager"].updates[-1]
+        assert update.trigger_count == 3
+        assert "'3'" in update.detail
+        assert update.summary().endswith("(3 triggers)")
+
+
+def test_an_output_shared_by_two_latched_rules_reports_both(tmp_path: Path) -> None:
+    rules = {"A": (["Mail"], ["Shared"]), "B": (["Hook"], ["Shared"])}
+    for harness in _build(tmp_path, rules=rules):
+        harness.fire("Mail")
+        harness.clock.advance(60)
+        harness.fire("Hook")
+
+        # The second event does not change Shared's value, so force a push the
+        # way reconciliation does and read what the output is told.
+        harness.engine.reconcile()
+        harness.engine.drain()
+
+        update = harness.outputs["Shared"].updates[-1]
+        assert update.rules == ("A", "B")
+        assert update.trigger_count == 2
+        assert update.cause == "Hook", "the most recently set rule is the cause"
+
+
+def test_a_cleared_output_is_told_nothing_beyond_the_state(simple: Harness) -> None:
+    simple.fire("Mail", metadata={"subject": "Delivered: box"})
+    simple.unlatch("Lamp")
+
+    update = simple.outputs["Lamp"].updates[-1]
+    assert update.state is False
+    assert update.cause == ""
+    assert update.rules == ()
+    assert update.summary() == "cleared"
