@@ -99,6 +99,57 @@ def test_an_empty_body_is_accepted(harness: Harness) -> None:
     assert len(harness.events) == 1
 
 
+# -- authentication is not optional -------------------------------------------
+
+
+def test_a_request_with_no_token_is_refused(harness: Harness) -> None:
+    assert harness.post(headers={}) == 401
+    assert harness.events == []
+
+
+def test_a_request_with_the_wrong_token_is_refused(harness: Harness) -> None:
+    assert harness.post(headers={"X-Noti-Mapper-Token": "wrong"}) == 401
+    assert harness.events == []
+
+
+def test_a_token_that_is_a_prefix_of_the_secret_is_refused(harness: Harness) -> None:
+    assert harness.post(headers={"X-Noti-Mapper-Token": SECRET[:-1]}) == 401
+    assert harness.events == []
+
+
+def test_the_wrong_path_is_a_404(harness: Harness) -> None:
+    assert harness.post(path="/somewhere-else") == 404
+    assert harness.events == []
+
+
+def test_get_is_not_accepted(harness: Harness) -> None:
+    assert harness.post(method="GET", body=b"") == 405
+    assert harness.events == []
+
+
+def test_an_oversized_body_is_refused(tmp_path: Path) -> None:
+    database = Database(path=database_path(tmp_path))
+    initialize(database)
+    events: list[ObservedEvent] = []
+    plugin = WebhookInput(
+        context=make_context(
+            instance_name="Hook",
+            database=database,
+            settings={"secret": SECRET, "port": 0, "path": "/hook", "max_body_bytes": 16},
+        ),
+        emit=events.append,
+    )
+    harness = Harness(plugin, events)
+    harness.start()
+    try:
+        assert harness.post(body=b"x" * 1000) == 413
+        assert events == []
+        assert harness.post(body=b"small") == 204
+    finally:
+        harness.stop()
+        database.close()
+
+
 # -- health and lifecycle -----------------------------------------------------
 
 
