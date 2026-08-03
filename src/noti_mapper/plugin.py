@@ -13,10 +13,12 @@ write-only -- both shipped output plugins need the reverse channel.
 
 import datetime
 import enum
-from collections.abc import Mapping
+import logging
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
-from noti_mapper.storage import HealthStatus
+from noti_mapper.clock import Clock
+from noti_mapper.storage import HealthStatus, PluginKeyValueStore
 
 # The maximum length of any single metadata value. Metadata is rendered into
 # log lines and into PagerDuty payloads; a webhook body has no natural bound.
@@ -100,3 +102,23 @@ class PluginHealth:
 
     status: HealthStatus
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class PluginContext:
+    """Everything a plugin instance is given at construction.
+
+    ``storage`` is durable per-instance key/value scratch space backed by the
+    same SQLite file as everything else -- one thing to back up, one thing to
+    migrate. Plugins do not manage their own files.
+    """
+
+    instance_name: str
+    settings: Mapping[str, object]
+    storage: PluginKeyValueStore
+    clock: Clock
+    logger: logging.Logger
+
+
+EmitCallback = Callable[[ObservedEvent], None]
+UnlatchCallback = Callable[[str], None]
