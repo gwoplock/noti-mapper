@@ -30,7 +30,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from noti_mapper.clock import from_iso
+from noti_mapper.clock import from_iso, to_iso
 
 SCHEMA_VERSION: int = 1
 DEFAULT_STATE_DIRECTORY: Path = Path("/var/lib/noti-mapper")
@@ -507,6 +507,52 @@ class Store:
                 )
             )
         return records
+
+    # -- latches --------------------------------------------------------------
+
+    def latch(self, rule_name: str) -> LatchRecord | None:
+        row = (
+            self._database.connection()
+            .execute("SELECT * FROM latches WHERE rule_name = ?", (rule_name,))
+            .fetchone()
+        )
+        if row is None:
+            return None
+        return _latch_from_row(row)
+
+    def latches(self) -> list[LatchRecord]:
+        rows = (
+            self._database.connection()
+            .execute("SELECT * FROM latches ORDER BY rule_name")
+            .fetchall()
+        )
+        records: list[LatchRecord] = []
+        for row in rows:
+            records.append(_latch_from_row(row))
+        return records
+
+    def write_latch(self, record: LatchRecord) -> None:
+        """Write a latch record. Callers on the core thread only."""
+        self._database.connection().execute(
+            """
+            INSERT INTO latches (rule_name, state, set_at, cleared_at, trigger_count, last_cause)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(rule_name) DO UPDATE SET
+                state = excluded.state,
+                set_at = excluded.set_at,
+                cleared_at = excluded.cleared_at,
+                trigger_count = excluded.trigger_count,
+                last_cause = excluded.last_cause
+            """,
+            (
+                record.rule_name,
+                int(record.state),
+                None if record.set_at is None else to_iso(record.set_at),
+                None if record.cleared_at is None else to_iso(record.cleared_at),
+                record.trigger_count,
+                record.last_cause,
+            ),
+        )
 
 
 class PluginKeyValueStore:

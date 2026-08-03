@@ -1,4 +1,5 @@
 import datetime
+import sqlite3
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -10,6 +11,7 @@ from noti_mapper.storage import (
     SCHEMA_VERSION,
     Database,
     InstanceRecord,
+    LatchRecord,
     PluginKeyValueStore,
     RuleRecord,
     StorageError,
@@ -93,6 +95,125 @@ def test_each_thread_gets_its_own_connection(store: Store) -> None:
     assert seen[0] != main
 
 
+# -- configuration mirror -----------------------------------------------------
+
+
+def test_sync_rules_creates_rules_latches_and_edges(store: Store) -> None:
+    store.sync_instances([_instance("Mail"), _instance("Lamp", "homekit-output")])
+    orphaned, readopted = store.sync_rules([_rule("R", ("Mail",), ("Lamp",))])
+
+    assert orphaned == []
+    assert readopted == []
+
+    rules = store.rules()
+    assert len(rules) == 1
+    assert rules[0].inputs == ("Mail",)
+    assert rules[0].outputs == ("Lamp",)
+
+    latch = store.latch("R")
+    assert latch is not None
+    assert latch.state is False
+    assert latch.trigger_count == 0
+
+
+def test_sync_rules_preserves_an_existing_latch(store: Store) -> None:
+    store.sync_rules([_rule("R", ("Mail",), ("Lamp",))])
+    store.write_latch(
+        LatchRecord(
+            rule_name="R",
+            state=True,
+            set_at=MOMENT,
+            cleared_at=None,
+            trigger_count=3,
+            last_cause="Porch Mail",
+        )
+    )
+
+    store.sync_rules([_rule("R", ("Mail", "Webhook"), ("Lamp",))])
+
+    latch = store.latch("R")
+    assert latch is not None
+    assert latch.state is True
+    assert latch.trigger_count == 3
+    assert latch.set_at == MOMENT
+    assert store.rules()[0].inputs == ("Mail", "Webhook")
+
+
+def test_removing_a_rule_orphans_it_and_keeps_the_latch(store: Store) -> None:
+    store.sync_rules([_rule("R", ("Mail",), ("Lamp",)), _rule("S", ("Mail",), ("Lamp",))])
+    store.write_latch(
+        LatchRecord(
+            rule_name="R",
+            state=True,
+            set_at=MOMENT,
+            cleared_at=None,
+            trigger_count=1,
+            last_cause="Mail",
+        )
+    )
+
+    orphaned, readopted = store.sync_rules([_rule("S", ("Mail",), ("Lamp",))])
+    assert orphaned == ["R"]
+    assert readopted == []
+
+    by_name = {rule.name: rule for rule in store.rules()}
+    assert by_name["R"].orphaned is True
+    assert by_name["S"].orphaned is False
+
+    latch = store.latch("R")
+    assert latch is not None
+    assert latch.state is True
+
+
+def test_a_returning_rule_readopts_its_latch(store: Store) -> None:
+    store.sync_rules([_rule("R", ("Mail",), ("Lamp",))])
+    store.write_latch(
+        LatchRecord(
+            rule_name="R",
+            state=True,
+            set_at=MOMENT,
+            cleared_at=None,
+            trigger_count=7,
+            last_cause="Mail",
+        )
+    )
+    store.sync_rules([])
+    orphaned, readopted = store.sync_rules([_rule("R", ("Mail",), ("Lamp",))])
+
+    assert orphaned == []
+    assert readopted == ["R"]
+    latch = store.latch("R")
+    assert latch is not None
+    assert latch.state is True
+    assert latch.trigger_count == 7
+
+
+def test_reload_does_not_disturb_unrelated_latches(store: Store) -> None:
+    store.sync_rules([_rule("Keep", ("A",), ("B",)), _rule("Change", ("A",), ("B",))])
+    store.write_latch(
+        LatchRecord(
+            rule_name="Keep",
+            state=True,
+            set_at=MOMENT,
+            cleared_at=None,
+            trigger_count=2,
+            last_cause="A",
+        )
+    )
+    store.sync_rules(
+        [
+            _rule("Keep", ("A",), ("B",)),
+            _rule("Change", ("A",), ("B", "C")),
+            _rule("New", ("A",), ("B",)),
+        ]
+    )
+
+    keep = store.latch("Keep")
+    assert keep is not None
+    assert keep.state is True
+    assert keep.trigger_count == 2
+
+
 def test_removing_an_instance_orphans_it_but_keeps_scratch_storage(store: Store) -> None:
     store.sync_instances([_instance("Mail"), _instance("Lamp", "homekit-output")])
     kv = PluginKeyValueStore(database=store.database, instance_name="Mail")
@@ -110,6 +231,52 @@ def test_orphaning_is_reported_only_once(store: Store) -> None:
     store.sync_rules([_rule("R", ("A",), ("B",))])
     assert store.sync_rules([])[0] == ["R"]
     assert store.sync_rules([])[0] == []
+
+
+# -- latches ------------------------------------------------------------------
+
+
+def test_latch_round_trips(store: Store) -> None:
+    store.sync_rules([_rule("R", ("A",), ("B",))])
+    cleared = MOMENT + datetime.timedelta(hours=2)
+    store.write_latch(
+        LatchRecord(
+            rule_name="R",
+            state=False,
+            set_at=MOMENT,
+            cleared_at=cleared,
+            trigger_count=5,
+            last_cause="Porch Lamp",
+        )
+    )
+
+    latch = store.latch("R")
+    assert latch == LatchRecord(
+        rule_name="R",
+        state=False,
+        set_at=MOMENT,
+        cleared_at=cleared,
+        trigger_count=5,
+        last_cause="Porch Lamp",
+    )
+
+
+def test_latch_for_an_unknown_rule_is_none(store: Store) -> None:
+    assert store.latch("nope") is None
+
+
+def test_writing_a_latch_for_an_unknown_rule_is_refused(store: Store) -> None:
+    with pytest.raises(sqlite3.IntegrityError):
+        store.write_latch(
+            LatchRecord(
+                rule_name="ghost",
+                state=True,
+                set_at=MOMENT,
+                cleared_at=None,
+                trigger_count=1,
+                last_cause=None,
+            )
+        )
 
 
 # -- plugin key/value ---------------------------------------------------------
