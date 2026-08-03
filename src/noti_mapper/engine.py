@@ -388,6 +388,60 @@ class Engine:
             extra={"rule": rule_name, "instance": cause, "state": True},
         )
 
+    # -- unlatch --------------------------------------------------------------
+
+    def _handle_unlatch(self, message: UnlatchRequestMessage) -> None:
+        now = self._clock.now()
+        rules = self._graph.rules_for_output(message.instance_name)
+        set_rules = [rule for rule in rules if self._latch(rule.name).state]
+
+        with self._store.database.transaction():
+            if not set_rules:
+                # Loop prevention: clearing via output A resolves output B,
+                # whose next poll observes the clear and issues its own unlatch.
+                # That second request must be a no-op, not a second transition.
+                self._append_event(
+                    at=now,
+                    kind=EventKind.UNLATCH_IGNORED,
+                    instance_name=message.instance_name,
+                    detail=message.cause,
+                )
+                self._log.debug(
+                    "unlatch from %s ignored; nothing was set",
+                    message.instance_name,
+                    extra={"instance": message.instance_name, "cause": message.cause},
+                )
+                return
+
+            for rule in set_rules:
+                record = self._latch(rule.name)
+                updated = replace(
+                    record, state=False, cleared_at=now, last_cause=message.instance_name
+                )
+                self._write_latch(updated)
+                self._append_event(
+                    at=now,
+                    kind=EventKind.LATCH_CLEARED,
+                    rule_name=rule.name,
+                    instance_name=message.instance_name,
+                    detail=message.cause,
+                )
+                self._log.info(
+                    "rule %r cleared by %r: %s",
+                    rule.name,
+                    message.instance_name,
+                    message.cause,
+                    extra={
+                        "rule": rule.name,
+                        "instance": message.instance_name,
+                        "state": False,
+                        "cause": message.cause,
+                    },
+                )
+
+            affected = self._graph.outputs_affected_by([rule.name for rule in rules])
+            self._sync_outputs(affected, now=now)
+
     # -- push results ---------------------------------------------------------
 
     def _handle_push_result(self, message: PushResultMessage) -> None:
