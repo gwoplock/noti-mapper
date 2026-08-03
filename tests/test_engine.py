@@ -205,6 +205,20 @@ def test_an_event_latches_the_rule_and_drives_the_output(simple: Harness) -> Non
     assert record.set_at == START
 
 
+def test_an_unlatch_clears_the_rule_and_drops_the_output(simple: Harness) -> None:
+    simple.fire("Mail")
+    simple.clock.advance(60)
+    simple.unlatch("Lamp", cause="switch written false")
+
+    assert simple.latch("R") is False
+    assert simple.applied("Lamp") == [True, False]
+
+    record = simple.store.latch("R")
+    assert record is not None
+    assert record.cleared_at == START + datetime.timedelta(seconds=60)
+    assert record.last_cause == "Lamp"
+
+
 def test_the_event_log_records_the_transition_and_its_cause(simple: Harness) -> None:
     simple.fire("Mail", metadata={"sender": "ups.com"})
     kinds = simple.event_kinds()
@@ -265,6 +279,95 @@ def test_multiple_inputs_are_ord(tmp_path: Path) -> None:
         assert harness.applied("Lamp") == [True]
 
 
+def test_two_outputs_on_one_rule_are_coupled(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp", "Pager"])}):
+        harness.fire("Mail")
+        assert harness.applied("Lamp") == [True]
+        assert harness.applied("Pager") == [True]
+
+        harness.unlatch("Pager", cause="incident resolved")
+
+        assert harness.latch("R") is False
+        assert harness.applied("Lamp") == [True, False]
+        assert harness.applied("Pager") == [True, False]
+
+
+def test_a_shared_output_is_the_or_of_its_rules(tmp_path: Path) -> None:
+    rules = {"A": (["Mail"], ["Shared", "OnlyA"]), "B": (["Hook"], ["Shared"])}
+    for harness in _build(tmp_path, rules=rules):
+        harness.fire("Mail")
+        harness.fire("Hook")
+        assert harness.applied("Shared") == [True]
+
+        # Clearing through OnlyA clears rule A. Rule B is still latched, so the
+        # shared output stays true and is not pushed again.
+        harness.unlatch("OnlyA")
+
+        assert harness.latch("A") is False
+        assert harness.latch("B") is True
+        assert harness.applied("Shared") == [True]
+        assert harness.applied("OnlyA") == [True, False]
+
+        harness.unlatch("Shared")
+        assert harness.latch("B") is False
+        assert harness.applied("Shared") == [True, False]
+
+
+def test_the_same_input_in_two_rules_latches_independently(tmp_path: Path) -> None:
+    rules = {"A": (["Mail"], ["LampA"]), "B": (["Mail"], ["LampB"])}
+    for harness in _build(tmp_path, rules=rules):
+        harness.fire("Mail")
+        assert harness.latch("A") is True
+        assert harness.latch("B") is True
+
+        harness.unlatch("LampA")
+
+        assert harness.latch("A") is False
+        assert harness.latch("B") is True
+        assert harness.applied("LampA") == [True, False]
+        assert harness.applied("LampB") == [True]
+
+
+def test_an_unlatch_clears_every_rule_the_output_renders(tmp_path: Path) -> None:
+    rules = {"A": (["Mail"], ["Shared"]), "B": (["Hook"], ["Shared"])}
+    for harness in _build(tmp_path, rules=rules):
+        harness.fire("Mail")
+        harness.fire("Hook")
+        harness.unlatch("Shared")
+        assert harness.latch("A") is False
+        assert harness.latch("B") is False
+
+
+# -- loop prevention ----------------------------------------------------------
+
+
+def test_an_unlatch_against_cleared_state_is_a_no_op(simple: Harness) -> None:
+    simple.unlatch("Lamp", cause="poller noticed a clear it caused")
+
+    assert simple.latch("R") is False
+    assert simple.applied("Lamp") == []
+    assert EventKind.UNLATCH_IGNORED in simple.event_kinds()
+    assert EventKind.LATCH_CLEARED not in simple.event_kinds()
+
+
+def test_a_second_unlatch_after_a_clear_produces_no_second_transition(
+    tmp_path: Path,
+) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp", "Pager"])}):
+        harness.fire("Mail")
+        harness.unlatch("Lamp", cause="switch off")
+        pushes_after_first = len(harness.applied("Pager"))
+
+        # The pager's poller sees the resolve that the first clear caused and
+        # issues its own unlatch. It must change nothing.
+        harness.unlatch("Pager", cause="incident observed resolved")
+
+        assert harness.latch("R") is False
+        assert len(harness.applied("Pager")) == pushes_after_first
+        assert harness.event_kinds().count(EventKind.LATCH_CLEARED) == 1
+        assert EventKind.UNLATCH_IGNORED in harness.event_kinds()
+
+
 # -- pushes cannot veto state -------------------------------------------------
 
 
@@ -318,6 +421,23 @@ def test_a_retry_eventually_succeeds_and_clears_the_pending_row(tmp_path: Path) 
         state = harness.store.output_state("Lamp")
         assert state is not None
         assert state.last_applied is True
+
+
+def test_a_retry_applies_current_state_not_the_value_that_failed(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        harness.outputs["Lamp"].configure(FakeOutputBehaviour(apply_always_fails=True))
+        harness.fire("Mail")
+        assert harness.store.pending_push("Lamp") is not None
+
+        # The latch clears while the push for True is still failing.
+        harness.outputs["Lamp"].configure(FakeOutputBehaviour())
+        harness.unlatch("Lamp", cause="operator")
+
+        harness.clock.advance(3600)
+        harness.engine.drain()
+
+        assert harness.applied("Lamp") == [False]
+        assert True not in harness.applied("Lamp")
 
 
 def test_a_pending_push_survives_a_restart(tmp_path: Path) -> None:
