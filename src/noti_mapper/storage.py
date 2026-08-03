@@ -733,6 +733,89 @@ class Store:
             return None
         return from_iso(str(row["soonest"]))
 
+    # -- health ---------------------------------------------------------------
+
+    def write_health(self, record: HealthRecord) -> None:
+        self._database.connection().execute(
+            """
+            INSERT INTO instance_health (instance_name, status, detail, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(instance_name) DO UPDATE SET
+                status = excluded.status,
+                detail = excluded.detail,
+                updated_at = excluded.updated_at
+            """,
+            (record.instance_name, record.status.value, record.detail, to_iso(record.updated_at)),
+        )
+
+    def health(self) -> list[HealthRecord]:
+        rows = (
+            self._database.connection()
+            .execute("SELECT * FROM instance_health ORDER BY instance_name")
+            .fetchall()
+        )
+        records: list[HealthRecord] = []
+        for row in rows:
+            records.append(
+                HealthRecord(
+                    instance_name=str(row["instance_name"]),
+                    status=HealthStatus(str(row["status"])),
+                    detail=str(row["detail"]),
+                    updated_at=from_iso(str(row["updated_at"])),
+                )
+            )
+        return records
+
+    # -- event log ------------------------------------------------------------
+
+    def append_event(
+        self,
+        *,
+        at: datetime.datetime,
+        kind: EventKind,
+        detail: str = "",
+        instance_name: str | None = None,
+        rule_name: str | None = None,
+        max_rows: int = 10_000,
+    ) -> None:
+        """Append to the rolling event log and drop the oldest rows past the cap."""
+        connection = self._database.connection()
+        connection.execute(
+            "INSERT INTO event_log (at, kind, instance_name, rule_name, detail) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (to_iso(at), kind.value, instance_name, rule_name, detail),
+        )
+        connection.execute(
+            "DELETE FROM event_log WHERE id <= " "(SELECT MAX(id) FROM event_log) - ?",
+            (max_rows,),
+        )
+
+    def recent_events(self, limit: int = 50) -> list[EventLogEntry]:
+        rows = (
+            self._database.connection()
+            .execute("SELECT * FROM event_log ORDER BY id DESC LIMIT ?", (limit,))
+            .fetchall()
+        )
+        entries: list[EventLogEntry] = []
+        for row in rows:
+            entries.append(
+                EventLogEntry(
+                    identifier=int(row["id"]),
+                    at=from_iso(str(row["at"])),
+                    kind=EventKind(str(row["kind"])),
+                    instance_name=(
+                        None if row["instance_name"] is None else str(row["instance_name"])
+                    ),
+                    rule_name=None if row["rule_name"] is None else str(row["rule_name"]),
+                    detail=str(row["detail"]),
+                )
+            )
+        return entries
+
+    def event_count(self) -> int:
+        row = self._database.connection().execute("SELECT COUNT(*) AS n FROM event_log").fetchone()
+        return int(row["n"])
+
 
 class PluginKeyValueStore:
     """Durable per-instance scratch storage for plugins.
