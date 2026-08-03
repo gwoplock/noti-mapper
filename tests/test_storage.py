@@ -324,6 +324,38 @@ def test_rename_refuses_unknown_and_colliding_names(store: Store) -> None:
         store.rename_rule(old_name="A", new_name="B")
 
 
+# -- purge --------------------------------------------------------------------
+
+
+def test_purge_removes_orphans_and_leaves_live_objects(store: Store) -> None:
+    store.sync_instances([_instance("Mail"), _instance("Lamp", "homekit-output")])
+    store.sync_rules([_rule("Live", ("Mail",), ("Lamp",)), _rule("Dead", ("Mail",), ("Lamp",))])
+    store.write_latch(
+        LatchRecord(
+            rule_name="Dead",
+            state=True,
+            set_at=MOMENT,
+            cleared_at=None,
+            trigger_count=1,
+            last_cause="Mail",
+        )
+    )
+    kv = PluginKeyValueStore(database=store.database, instance_name="Mail")
+    kv.set("last_uid", "1")
+
+    store.sync_rules([_rule("Live", ("Mail",), ("Lamp",))])
+    store.sync_instances([_instance("Lamp", "homekit-output")])
+
+    purged_rules, purged_instances = store.purge_orphans()
+    assert purged_rules == ["Dead"]
+    assert purged_instances == ["Mail"]
+
+    assert store.latch("Dead") is None
+    assert store.latch("Live") is not None
+    assert [rule.name for rule in store.rules()] == ["Live"]
+    assert kv.get("last_uid") is None
+
+
 # -- plugin key/value ---------------------------------------------------------
 
 

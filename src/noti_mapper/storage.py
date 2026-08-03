@@ -592,6 +592,37 @@ class Store:
             )
             transaction.execute("DELETE FROM rules WHERE name = ?", (old_name,))
 
+    def purge_orphans(self) -> tuple[list[str], list[str]]:
+        """Delete orphaned rules (with their latches) and orphaned instance state.
+
+        Returns ``(purged_rules, purged_instances)``.
+        """
+        with self._database.transaction() as transaction:
+            rule_rows = transaction.execute(
+                "SELECT name FROM rules WHERE orphaned = 1 ORDER BY name"
+            ).fetchall()
+            instance_rows = transaction.execute(
+                "SELECT name FROM instances WHERE orphaned = 1 ORDER BY name"
+            ).fetchall()
+
+            purged_rules = [str(row["name"]) for row in rule_rows]
+            purged_instances = [str(row["name"]) for row in instance_rows]
+
+            for name in purged_rules:
+                transaction.execute("DELETE FROM latches WHERE rule_name = ?", (name,))
+                transaction.execute("DELETE FROM rule_inputs WHERE rule_name = ?", (name,))
+                transaction.execute("DELETE FROM rule_outputs WHERE rule_name = ?", (name,))
+                transaction.execute("DELETE FROM rules WHERE name = ?", (name,))
+
+            for name in purged_instances:
+                transaction.execute("DELETE FROM plugin_kv WHERE instance_name = ?", (name,))
+                transaction.execute("DELETE FROM output_state WHERE instance_name = ?", (name,))
+                transaction.execute("DELETE FROM pending_pushes WHERE instance_name = ?", (name,))
+                transaction.execute("DELETE FROM instance_health WHERE instance_name = ?", (name,))
+                transaction.execute("DELETE FROM instances WHERE name = ?", (name,))
+
+        return (purged_rules, purged_instances)
+
 
 class PluginKeyValueStore:
     """Durable per-instance scratch storage for plugins.
