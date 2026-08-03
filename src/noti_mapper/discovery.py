@@ -22,7 +22,12 @@ plugin that failed to load is, however, a fatal configuration error, and
 validator is what produces that.
 """
 
-from collections.abc import Mapping
+import importlib.util
+import inspect
+import logging
+import sys
+import traceback
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -102,3 +107,148 @@ def default_search_path() -> list[Path]:
     directories.append(PACKAGED_PLUGIN_DIRECTORY)
     directories.append(LOCAL_PLUGIN_DIRECTORY)
     return directories
+
+
+def discover(
+    *, search_path: Sequence[Path], logger: logging.Logger | None = None
+) -> DiscoveryResult:
+    """Scan for plugins. Never raises; problems come back as failures."""
+    log = logger if logger is not None else logging.getLogger(__name__)
+    plugins: dict[str, LoadedPlugin] = {}
+    failures: list[PluginLoadFailure] = []
+
+    for directory in search_path:
+        if not directory.is_dir():
+            log.debug("plugin directory %s does not exist, skipping", directory)
+            continue
+        for candidate in sorted(directory.iterdir()):
+            if not _looks_like_a_plugin(candidate):
+                continue
+            outcome = _load_one(directory=candidate, log=log)
+            if isinstance(outcome, PluginLoadFailure):
+                failures.append(outcome)
+                log.error(
+                    "plugin at %s failed to load: %s",
+                    outcome.directory,
+                    outcome.message,
+                    extra={"plugin_directory": str(outcome.directory)},
+                )
+                if outcome.traceback_text:
+                    log.error("%s", outcome.traceback_text)
+                continue
+
+            existing = plugins.get(outcome.plugin_name)
+            if existing is not None:
+                failure = PluginLoadFailure(
+                    directory=outcome.directory,
+                    message=(
+                        f"plugin name {outcome.plugin_name!r} is already provided by "
+                        f"{existing.directory}; the first one found wins"
+                    ),
+                )
+                failures.append(failure)
+                log.error("%s", failure.message)
+                continue
+
+            plugins[outcome.plugin_name] = outcome
+            log.info(
+                "loaded plugin %s from %s",
+                outcome.plugin_name,
+                outcome.directory,
+                extra={"plugin": outcome.plugin_name},
+            )
+
+    return DiscoveryResult(plugins=plugins, failures=tuple(failures))
+
+
+def _looks_like_a_plugin(candidate: Path) -> bool:
+    if not candidate.is_dir():
+        return False
+    if candidate.name.startswith((".", "_")):
+        return False
+    return (candidate / "__init__.py").is_file()
+
+
+def _load_one(*, directory: Path, log: logging.Logger) -> LoadedPlugin | PluginLoadFailure:
+    module_name = _MODULE_PREFIX + directory.name.replace("-", "_")
+    init_file = directory / "__init__.py"
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            module_name, init_file, submodule_search_locations=[str(directory)]
+        )
+        if spec is None or spec.loader is None:
+            return PluginLoadFailure(
+                directory=directory, message="Python could not build an import spec for it"
+            )
+        module = importlib.util.module_from_spec(spec)
+        # Registered before execution so that a plugin split across several
+        # files can import its own submodules.
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    except BaseException as error:  # noqa: BLE001 - one bad plugin must not stop startup
+        sys.modules.pop(module_name, None)
+        return PluginLoadFailure(
+            directory=directory,
+            message=f"{type(error).__name__}: {error}",
+            traceback_text=traceback.format_exc(),
+        )
+
+    log.debug("imported %s from %s", module_name, init_file)
+    return _inspect_module(module=module, directory=directory)
+
+
+def _inspect_module(*, module: object, directory: Path) -> LoadedPlugin | PluginLoadFailure:
+    plugin_name = getattr(module, PLUGIN_NAME_ATTRIBUTE, None)
+    if plugin_name is None:
+        return PluginLoadFailure(
+            directory=directory, message=f"it does not define {PLUGIN_NAME_ATTRIBUTE}"
+        )
+    if not isinstance(plugin_name, str) or not plugin_name.strip():
+        return PluginLoadFailure(
+            directory=directory, message=f"{PLUGIN_NAME_ATTRIBUTE} must be a non-empty string"
+        )
+
+    input_class = getattr(module, INPUT_PLUGIN_ATTRIBUTE, None)
+    output_class = getattr(module, OUTPUT_PLUGIN_ATTRIBUTE, None)
+
+    if input_class is None and output_class is None:
+        return PluginLoadFailure(
+            directory=directory,
+            message=(
+                f"it defines neither {INPUT_PLUGIN_ATTRIBUTE} nor "
+                f"{OUTPUT_PLUGIN_ATTRIBUTE}, so it cannot do anything"
+            ),
+        )
+
+    if input_class is not None:
+        problem = _check_class(
+            candidate=input_class, base=InputPlugin, attribute=INPUT_PLUGIN_ATTRIBUTE
+        )
+        if problem is not None:
+            return PluginLoadFailure(directory=directory, message=problem)
+
+    if output_class is not None:
+        problem = _check_class(
+            candidate=output_class, base=OutputPlugin, attribute=OUTPUT_PLUGIN_ATTRIBUTE
+        )
+        if problem is not None:
+            return PluginLoadFailure(directory=directory, message=problem)
+
+    return LoadedPlugin(
+        plugin_name=plugin_name.strip(),
+        directory=directory,
+        input_class=input_class,
+        output_class=output_class,
+    )
+
+
+def _check_class(*, candidate: object, base: type, attribute: str) -> str | None:
+    if not inspect.isclass(candidate):
+        return f"{attribute} is not a class"
+    if not issubclass(candidate, base):
+        return f"{attribute} does not subclass {base.__name__}"
+    if inspect.isabstract(candidate):
+        missing = ", ".join(sorted(getattr(candidate, "__abstractmethods__", frozenset())))
+        return f"{attribute} does not implement: {missing}"
+    return None
