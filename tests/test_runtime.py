@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from noti_mapper.clock import SystemClock
-from noti_mapper.runtime import Daemon, Paths
+from noti_mapper.runtime import Daemon, Paths, StartupError
 from noti_mapper.sdnotify import Notifier
 from noti_mapper.storage import Database, HealthStatus, Store, database_path
 from tests.probe_plugins import write_probe_plugins
@@ -253,3 +253,40 @@ def test_readiness_is_signalled_only_after_reconciliation(workspace: dict[str, P
     assert notified[0].startswith("STATUS reconciling")
     assert notified[1].startswith("READY")
     assert "1 rules" in notified[1]
+
+
+# -- startup failures ---------------------------------------------------------
+
+
+def test_an_invalid_configuration_refuses_to_start(workspace: dict[str, Path]) -> None:
+    _write_config(workspace, {"instances": {"A": {"plugin": "does-not-exist"}}})
+    daemon = Daemon(paths=_paths(workspace), notifier=Notifier(address=""), handle_signals=False)
+    with pytest.raises(StartupError, match="unknown plugin"):
+        daemon.start()
+    daemon.stop()
+
+
+def test_a_missing_required_setting_is_a_startup_error(workspace: dict[str, Path]) -> None:
+    _write_config(
+        workspace,
+        {
+            "instances": {"Porch Mail": {"plugin": "probe-input", "config": {}}},
+            "rules": {},
+        },
+    )
+    daemon = Daemon(paths=_paths(workspace), notifier=Notifier(address=""), handle_signals=False)
+    with pytest.raises(StartupError, match="trigger_file"):
+        daemon.start()
+    daemon.stop()
+
+
+def test_world_readable_secrets_refuse_to_start(workspace: dict[str, Path]) -> None:
+    _default_config(workspace)
+    secrets = workspace["root"] / "secrets.json"
+    secrets.write_text(json.dumps({"pw": "hunter2"}), encoding="utf-8")
+    secrets.chmod(0o644)
+
+    daemon = Daemon(paths=_paths(workspace), notifier=Notifier(address=""), handle_signals=False)
+    with pytest.raises(StartupError, match="chmod 0600"):
+        daemon.start()
+    daemon.stop()
