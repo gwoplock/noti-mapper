@@ -182,3 +182,68 @@ class InputPlugin(abc.ABC):
         acceptable; raise :class:`PluginError` to say so explicitly and have it
         logged and retried.
         """
+
+
+class OutputPlugin(abc.ABC):
+    """Renders latch state, and sources unlatch requests.
+
+    The reverse channel is not optional. An output that cannot tell the core
+    "the operator cleared this" leaves the user with no way to unlatch.
+    """
+
+    def __init__(self, *, context: PluginContext, request_unlatch: UnlatchCallback) -> None:
+        self._context = context
+        self._unlatch_callback = request_unlatch
+
+    @property
+    def context(self) -> PluginContext:
+        return self._context
+
+    def request_unlatch(self, cause: str) -> None:
+        """Ask the core to clear every latch this output contributes to.
+
+        Safe to call from any thread the plugin owns; the request goes onto the
+        same queue as input events and is handled by the same serialized path.
+        Idempotent by construction -- a request against already-cleared state
+        is a no-op, not a second transition -- so a poller that notices a clear
+        it caused itself does no harm.
+        """
+        self._unlatch_callback(cause)
+
+    @classmethod
+    def validate_settings(cls, settings: Mapping[str, object]) -> list[str]:
+        """Return every problem with an instance's ``config`` block."""
+        del settings
+        return []
+
+    @abc.abstractmethod
+    def start(self) -> None:
+        """Start whatever threads or servers the output needs. Must not block."""
+
+    @abc.abstractmethod
+    def stop(self) -> None:
+        """Shut down. Must be safe to call whether or not start() succeeded."""
+
+    @abc.abstractmethod
+    def apply(self, state: bool) -> None:
+        """Drive the remote to ``state``.
+
+        Called from a dispatcher thread, never the core thread, so blocking on
+        the network here is fine. Raise :class:`PluginError` on failure; the
+        push is retried with backoff and the latch is unaffected.
+
+        Must be idempotent: the same value may be applied repeatedly, and is
+        during reconciliation.
+        """
+
+    @abc.abstractmethod
+    def query(self) -> RemoteState:
+        """Ask the remote what it currently believes, for reconciliation.
+
+        Return ``RemoteBelief.UNKNOWN`` when the remote cannot be reached.
+        Raising is also acceptable and is treated the same way.
+        """
+
+    @abc.abstractmethod
+    def health(self) -> PluginHealth:
+        """Report health. Called from the core thread, so do not block."""
