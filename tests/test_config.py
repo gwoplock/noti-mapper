@@ -9,6 +9,7 @@ from noti_mapper.config import (
     ConfigurationError,
     KnownPlugin,
     PluginDirection,
+    discover_config_files,
     load_configuration,
 )
 from noti_mapper.secrets import SecretStore, empty_store
@@ -57,6 +58,148 @@ def _errors(
     with pytest.raises(ConfigurationError) as caught:
         _load(directory, secrets=secrets, known=known)
     return [str(error) for error in caught.value.errors]
+
+
+# -- happy path ---------------------------------------------------------------
+
+
+def test_the_documented_example_loads(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "10-instances.json",
+        {
+            "instances": {
+                "Porch Mail": {
+                    "plugin": "imap-input",
+                    "config": {
+                        "host": "mail.example.net",
+                        "senders": ["amazon.com", "ups.com"],
+                        "subject_patterns": ["^Delivered:"],
+                        "dry_run": False,
+                    },
+                },
+                "Porch Lamp": {
+                    "plugin": "homekit-output",
+                    "config": {"display_name": "Package Waiting"},
+                },
+                "Porch Pager": {"plugin": "pagerduty-output"},
+            }
+        },
+    )
+    _write(
+        tmp_path,
+        "20-rules.json",
+        {
+            "rules": {
+                "Package On Porch": {
+                    "inputs": ["Porch Mail"],
+                    "outputs": ["Porch Lamp", "Porch Pager"],
+                }
+            }
+        },
+    )
+
+    configuration = _load(tmp_path)
+    assert isinstance(configuration.instances, Mapping)
+    assert sorted(configuration.instances) == ["Porch Lamp", "Porch Mail", "Porch Pager"]
+
+    rule = configuration.rules["Package On Porch"]
+    assert rule.inputs == ("Porch Mail",)
+    assert rule.outputs == ("Porch Lamp", "Porch Pager")
+    assert rule.enabled is True
+
+    mail = configuration.instances["Porch Mail"]
+    assert mail.plugin == "imap-input"
+    assert mail.settings["host"] == "mail.example.net"
+    assert mail.settings["dry_run"] is False
+    assert mail.is_input() and not mail.is_output()
+
+    pager = configuration.instances["Porch Pager"]
+    assert pager.settings == {}
+
+
+def test_instances_and_rules_may_share_one_file(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "all.json",
+        {
+            "instances": {
+                "In": {"plugin": "imap-input"},
+                "Out": {"plugin": "homekit-output"},
+            },
+            "rules": {"R": {"inputs": ["In"], "outputs": ["Out"]}},
+        },
+    )
+    configuration = _load(tmp_path)
+    assert list(configuration.rules) == ["R"]
+
+
+def test_a_rule_may_share_a_name_with_an_instance(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "all.json",
+        {
+            "instances": {
+                "Porch": {"plugin": "imap-input"},
+                "Out": {"plugin": "homekit-output"},
+            },
+            "rules": {"Porch": {"inputs": ["Porch"], "outputs": ["Out"]}},
+        },
+    )
+    configuration = _load(tmp_path)
+    assert "Porch" in configuration.instances
+    assert "Porch" in configuration.rules
+
+
+def test_names_are_stripped_of_surrounding_whitespace(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "all.json",
+        {
+            "instances": {
+                "  Porch Mail  ": {"plugin": "imap-input"},
+                "Out": {"plugin": "homekit-output"},
+            },
+            "rules": {"R": {"inputs": ["Porch Mail"], "outputs": ["Out"]}},
+        },
+    )
+    configuration = _load(tmp_path)
+    assert "Porch Mail" in configuration.instances
+
+
+def test_enabled_false_is_carried_through(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "all.json",
+        {
+            "instances": {
+                "In": {"plugin": "imap-input", "enabled": False},
+                "Out": {"plugin": "homekit-output"},
+            },
+            "rules": {"R": {"inputs": ["In"], "outputs": ["Out"], "enabled": False}},
+        },
+    )
+    configuration = _load(tmp_path)
+    assert configuration.instances["In"].enabled is False
+    assert configuration.enabled_instances() == [configuration.instances["Out"]]
+    assert configuration.enabled_rules() == []
+
+
+# -- merging ------------------------------------------------------------------
+
+
+def test_files_are_read_in_lexical_order(tmp_path: Path) -> None:
+    _write(tmp_path, "20-b.json", {"instances": {"B": {"plugin": "homekit-output"}}})
+    _write(tmp_path, "10-a.json", {"instances": {"A": {"plugin": "imap-input"}}})
+    _write(tmp_path, "30-r.json", {"rules": {"R": {"inputs": ["A"], "outputs": ["B"]}}})
+
+    assert [path.name for path in discover_config_files(tmp_path)] == [
+        "10-a.json",
+        "20-b.json",
+        "30-r.json",
+    ]
+    configuration = _load(tmp_path)
+    assert sorted(configuration.instances) == ["A", "B"]
 
 
 def test_redefining_a_name_in_a_later_file_is_an_error(tmp_path: Path) -> None:

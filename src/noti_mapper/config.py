@@ -427,6 +427,144 @@ class _Loader:
                 rules[rule.name] = rule
         return rules
 
+    def _build_rule(
+        self, *, draft: _RuleDraft, instances: Mapping[str, InstanceConfig]
+    ) -> RuleConfig | None:
+        self._reject_unknown_keys(
+            node=draft.node, allowed=_RULE_KEYS, subject=f"rule {draft.name!r}"
+        )
+
+        inputs = self._rule_members(
+            draft=draft,
+            key="inputs",
+            direction=PluginDirection.INPUT,
+            instances=instances,
+        )
+        outputs = self._rule_members(
+            draft=draft,
+            key="outputs",
+            direction=PluginDirection.OUTPUT,
+            instances=instances,
+        )
+        if inputs is None or outputs is None:
+            return None
+
+        overlap = sorted(set(inputs) & set(outputs))
+        for name in overlap:
+            self._errors.append(
+                ConfigError(
+                    f"rule {draft.name!r} lists instance {name!r} as both an input and "
+                    "an output, which would make the rule latch itself",
+                    draft.origin,
+                )
+            )
+        if overlap:
+            return None
+
+        enabled = self._optional_bool(
+            node=draft.node, key="enabled", default=True, subject=f"rule {draft.name!r}"
+        )
+
+        return RuleConfig(
+            name=draft.name,
+            inputs=inputs,
+            outputs=outputs,
+            enabled=enabled,
+            origin=draft.origin,
+        )
+
+    def _rule_members(
+        self,
+        *,
+        draft: _RuleDraft,
+        key: str,
+        direction: PluginDirection,
+        instances: Mapping[str, InstanceConfig],
+    ) -> tuple[str, ...] | None:
+        node = draft.node.members.get(key)
+        if node is None:
+            self._errors.append(ConfigError(f'rule {draft.name!r} has no "{key}"', draft.origin))
+            return None
+        if not isinstance(node, JsonArray):
+            self._errors.append(
+                ConfigError(
+                    f'rule {draft.name!r}: "{key}" must be an array of instance names',
+                    node.location,
+                )
+            )
+            return None
+        if not node.elements:
+            self._errors.append(
+                ConfigError(
+                    f'rule {draft.name!r}: "{key}" is empty; a rule with no {key} can '
+                    "never do anything",
+                    node.location,
+                )
+            )
+            return None
+
+        names: list[str] = []
+        ok = True
+        for element in node.elements:
+            if not isinstance(element, JsonScalar) or not isinstance(element.value, str):
+                self._errors.append(
+                    ConfigError(
+                        f'rule {draft.name!r}: "{key}" entries must be instance names',
+                        element.location,
+                    )
+                )
+                ok = False
+                continue
+
+            name = normalize_name(element.value)
+            if name in names:
+                self._errors.append(
+                    ConfigError(
+                        f'rule {draft.name!r}: {name!r} is listed twice in "{key}"',
+                        element.location,
+                    )
+                )
+                ok = False
+                continue
+
+            instance = instances.get(name)
+            if instance is None:
+                if name not in self._broken_instances:
+                    self._errors.append(
+                        ConfigError(
+                            f"rule {draft.name!r} references unknown instance {name!r}"
+                            + self._suggestion_for(name),
+                            element.location,
+                        )
+                    )
+                ok = False
+                continue
+
+            if direction not in instance.directions:
+                actual = ", ".join(sorted(item.value for item in instance.directions))
+                self._errors.append(
+                    ConfigError(
+                        f'rule {draft.name!r} lists {name!r} under "{key}", but plugin '
+                        f"{instance.plugin!r} provides only: {actual}",
+                        element.location,
+                    )
+                )
+                ok = False
+                continue
+
+            names.append(name)
+
+        if not ok:
+            return None
+        return tuple(names)
+
+    def _suggestion_for(self, name: str) -> str:
+        suggestion = self._registry.suggest(name=name, namespace=Namespace.INSTANCE)
+        if suggestion is not None:
+            return f"; did you mean {suggestion!r}?"
+        known = ", ".join(self._registry.names(Namespace.INSTANCE)) or "(none)"
+        return f". Defined instances: {known}"
+
     # -- shared field helpers -------------------------------------------------
 
     def _reject_unknown_keys(
