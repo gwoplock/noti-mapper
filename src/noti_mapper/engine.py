@@ -20,7 +20,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from noti_mapper.clock import Clock
-from noti_mapper.config import Configuration, DaemonSettings
+from noti_mapper.config import DaemonSettings
 from noti_mapper.dispatcher import Dispatcher
 from noti_mapper.messages import (
     CatchUpMessage,
@@ -122,9 +122,13 @@ class Engine:
         self._stopping = False
         self._ready = threading.Event()
         self._last_seen_written_at: datetime.datetime | None = None
+        self._heartbeat: datetime.datetime | None = None
 
         self.reload_latches()
-        self._schedule(after_seconds=HEALTH_POLL_INTERVAL_SECONDS, message=PollHealthMessage())
+        # Poll health on the first tick rather than waiting a full interval, so
+        # that 'noti-mapper status' has something to say immediately after a
+        # start rather than reporting "(none reported)" for the first 30s.
+        self._schedule(after_seconds=0.0, message=PollHealthMessage())
 
     # -- accessors ------------------------------------------------------------
 
@@ -136,6 +140,15 @@ class Engine:
     def ready(self) -> threading.Event:
         """Set once startup reconciliation has finished."""
         return self._ready
+
+    @property
+    def heartbeat(self) -> datetime.datetime | None:
+        """When the core loop last completed a tick.
+
+        The watchdog reads this. A process that is alive with a dead core loop
+        is exactly the silent failure this daemon must not have.
+        """
+        return self._heartbeat
 
     def latch_states(self) -> dict[str, bool]:
         states: dict[str, bool] = {}
@@ -173,18 +186,23 @@ class Engine:
         """Consume the queue until told to stop. Owns the calling thread."""
         self._log.info("core loop running")
 
-        while not self._stopping:
-            timeout = self._next_timeout()
-            try:
-                message = self._queue.get(timeout=timeout)
-            except queue.Empty:
-                self._tick()
-                continue
-            self._handle(message)
-            if not self._stopping:
-                self._tick()
+        try:
+            while not self._stopping:
+                timeout = self._next_timeout()
+                try:
+                    message = self._queue.get(timeout=timeout)
+                except queue.Empty:
+                    self._tick()
+                    continue
+                self._handle(message)
+                if not self._stopping:
+                    self._tick()
 
-        self._on_stop()
+            self._on_stop()
+        finally:
+            # This thread opened its own SQLite connection; nobody else can
+            # close it, because sqlite3 refuses cross-thread use.
+            self._store.database.close()
 
     def drain(self) -> int:
         """Process everything currently queued, then return.
@@ -245,6 +263,7 @@ class Engine:
 
     def _tick(self) -> None:
         now = self._clock.now()
+        self._heartbeat = now
         self._fire_due_timers(now)
         self._dispatch_due_pushes(now)
         self._maybe_write_last_seen(now)
@@ -593,6 +612,10 @@ class Engine:
         now = self._clock.now()
         previous_outputs = set(self._graph.output_names())
 
+        if message.plugins is not None:
+            self._plugins = message.plugins
+            self._dispatcher.set_outputs(message.plugins.outputs)
+
         self._graph = RuleGraph.from_configuration(message.configuration, logger=self._log)
         self.reload_latches()
 
@@ -611,12 +634,7 @@ class Engine:
             len(message.configuration.rules),
             len(message.configuration.instances),
         )
-
-    def adopt(self, *, configuration: Configuration, plugins: PluginSet) -> None:
-        """Swap in a new plugin set and configuration. Core thread only."""
-        self._plugins = plugins
-        self._dispatcher.set_outputs(plugins.outputs)
-        self._handle_reload(ReloadMessage(configuration=configuration))
+        message.acknowledged.set()
 
     # -- health ---------------------------------------------------------------
 
