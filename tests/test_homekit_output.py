@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from homekit_output import PERSIST_FILENAME, HomeKitOutput
-from noti_mapper.plugin import OutputUpdate, PluginError
+from noti_mapper.plugin import OutputUpdate, PluginError, RemoteBelief
 from noti_mapper.storage import Database, HealthStatus, database_path, initialize
 from tests.support import make_context
 
@@ -103,6 +103,99 @@ def test_applying_before_start_raises_so_the_push_retries(
     plugin = _plugin(tmp_path, database, [])
     with pytest.raises(PluginError, match="not running"):
         plugin.apply(OutputUpdate(state=True))
+
+
+# -- the write direction ------------------------------------------------------
+
+
+def test_apply_drives_the_switch_characteristic(
+    started: tuple[HomeKitOutput, list[str]],
+) -> None:
+    plugin, _ = started
+    accessory = plugin._accessory  # noqa: SLF001
+    assert accessory is not None
+
+    plugin.apply(OutputUpdate(state=True, detail="Delivered: box", trigger_count=1))
+    assert accessory.current_state() is True
+
+    plugin.apply(OutputUpdate(state=False))
+    assert accessory.current_state() is False
+
+
+def test_apply_is_idempotent(started: tuple[HomeKitOutput, list[str]]) -> None:
+    plugin, _ = started
+    accessory = plugin._accessory  # noqa: SLF001
+    assert accessory is not None
+
+    for _ in range(3):
+        plugin.apply(OutputUpdate(state=True))
+    assert accessory.current_state() is True
+
+
+# -- the reverse direction ----------------------------------------------------
+
+
+def test_writing_false_requests_an_unlatch(
+    started: tuple[HomeKitOutput, list[str]],
+) -> None:
+    plugin, unlatches = started
+    plugin.apply(OutputUpdate(state=True))
+
+    plugin.characteristic_written(False)
+
+    assert unlatches == ["HomeKit switch written false"]
+
+
+def test_writing_true_is_accepted_and_then_corrected(
+    started: tuple[HomeKitOutput, list[str]],
+) -> None:
+    plugin, unlatches = started
+    accessory = plugin._accessory  # noqa: SLF001
+    assert accessory is not None
+
+    plugin.apply(OutputUpdate(state=False))
+    plugin.characteristic_written(True)
+
+    # Only an input can set a latch, so the switch snaps back rather than the
+    # write being refused outright.
+    assert unlatches == []
+    assert accessory.current_state() is False
+
+
+def test_writing_true_while_latched_leaves_it_latched(
+    started: tuple[HomeKitOutput, list[str]],
+) -> None:
+    plugin, unlatches = started
+    accessory = plugin._accessory  # noqa: SLF001
+    assert accessory is not None
+
+    plugin.apply(OutputUpdate(state=True))
+    plugin.characteristic_written(True)
+
+    assert unlatches == []
+    assert accessory.current_state() is True
+
+
+def test_a_write_through_the_characteristic_setter_reaches_the_plugin(
+    started: tuple[HomeKitOutput, list[str]],
+) -> None:
+    plugin, unlatches = started
+    accessory = plugin._accessory  # noqa: SLF001
+    assert accessory is not None
+
+    # This is the path a real controller takes: HAP-python calls the setter
+    # callback the accessory registered.
+    accessory._written(False)  # noqa: SLF001
+    assert unlatches == ["HomeKit switch written false"]
+
+
+def test_query_reports_unknown_because_homekit_holds_no_state(
+    started: tuple[HomeKitOutput, list[str]],
+) -> None:
+    plugin, _ = started
+    state = plugin.query()
+    assert state.belief is RemoteBelief.UNKNOWN
+    assert state.cleared_at is None
 
 
 # -- naming and settings ------------------------------------------------------
