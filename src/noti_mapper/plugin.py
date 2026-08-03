@@ -11,6 +11,7 @@ incident, and that is how the latch clears. Do not model an output as
 write-only -- both shipped output plugins need the reverse channel.
 """
 
+import abc
 import datetime
 import enum
 import logging
@@ -122,3 +123,62 @@ class PluginContext:
 
 EmitCallback = Callable[[ObservedEvent], None]
 UnlatchCallback = Callable[[str], None]
+
+
+class InputPlugin(abc.ABC):
+    """Watches something and emits events.
+
+    One thread per input instance. Blocking in :meth:`start` is expected and
+    correct -- an IMAP IDLE loop belongs in its own thread and needs no async
+    plumbing.
+    """
+
+    def __init__(self, *, context: PluginContext, emit: EmitCallback) -> None:
+        self._context = context
+        self._emit_callback = emit
+
+    @property
+    def context(self) -> PluginContext:
+        return self._context
+
+    def emit(self, event: ObservedEvent) -> None:
+        """Report an event to the core. Safe to call from the plugin's thread."""
+        self._emit_callback(event)
+
+    @classmethod
+    def validate_settings(cls, settings: Mapping[str, object]) -> list[str]:
+        """Return every problem with an instance's ``config`` block.
+
+        Returns a list rather than raising so that configuration validation can
+        report all problems across all instances in one pass. The default
+        accepts anything; plugins with required settings override it.
+        """
+        del settings
+        return []
+
+    @abc.abstractmethod
+    def start(self) -> None:
+        """Begin watching. Called on the instance's own thread."""
+
+    @abc.abstractmethod
+    def stop(self) -> None:
+        """Ask the plugin to return from :meth:`start`. Called from another thread."""
+
+    @abc.abstractmethod
+    def health(self) -> PluginHealth:
+        """Report health. Called from the core thread, so do not block."""
+
+    @abc.abstractmethod
+    def catch_up(self, since: datetime.datetime | None) -> list[ObservedEvent]:
+        """Return events observed while the daemon was stopped, with timestamps.
+
+        ``since`` is the last time the daemon is known to have been running, or
+        None if there is no such record. The timestamps on the returned events
+        are what reconciliation compares against an output's clear time, so
+        they must be the time the event actually happened -- the message date,
+        not the time it was noticed.
+
+        Returning an empty list because the remote is unreachable is
+        acceptable; raise :class:`PluginError` to say so explicitly and have it
+        logged and retried.
+        """
