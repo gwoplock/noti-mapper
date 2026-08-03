@@ -12,8 +12,11 @@ write-only -- both shipped output plugins need the reverse channel.
 """
 
 import datetime
+import enum
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+
+from noti_mapper.storage import HealthStatus
 
 # The maximum length of any single metadata value. Metadata is rendered into
 # log lines and into PagerDuty payloads; a webhook body has no natural bound.
@@ -65,3 +68,35 @@ def clamp_metadata(metadata: Mapping[str, str]) -> dict[str, str]:
         else:
             clamped[key] = value
     return clamped
+
+
+class RemoteBelief(enum.Enum):
+    """What an output's remote end currently thinks the state is."""
+
+    ACTIVE = "active"
+    CLEARED = "cleared"
+    # The remote could not be reached, or has no opinion yet. Reconciliation
+    # falls back to persisted state rather than guessing.
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class RemoteState:
+    """An output's report of what its remote end believes.
+
+    ``cleared_at`` matters enormously: reconciliation compares it against the
+    timestamps of events observed during downtime. An output reporting CLEARED
+    without a timestamp is treated as "cleared at an unknown time in the past",
+    which loses to any input event.
+    """
+
+    belief: RemoteBelief
+    cleared_at: datetime.datetime | None = None
+
+
+@dataclass(frozen=True)
+class PluginHealth:
+    """A plugin instance's own opinion of how it is doing."""
+
+    status: HealthStatus
+    detail: str = ""
