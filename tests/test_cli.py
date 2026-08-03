@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from noti_mapper import VERSION
-from noti_mapper.cli import EXIT_FAILURE, EXIT_OK, main
+from noti_mapper.cli import EXIT_CONFIG_ERROR, EXIT_FAILURE, EXIT_OK, main
 from noti_mapper.storage import (
     Database,
     InstanceRecord,
@@ -129,3 +129,70 @@ def test_version(capsys: pytest.CaptureFixture[str]) -> None:
 def test_an_unknown_log_level_is_refused(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["--log-level", "chatty", "version"]) == EXIT_FAILURE
     assert "unknown log level" in capsys.readouterr().err
+
+
+# -- validate -----------------------------------------------------------------
+
+
+def test_validate_accepts_a_good_configuration(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _valid_config(workspace)
+    assert main(_argv(workspace, "validate")) == EXIT_OK
+
+    output = capsys.readouterr().out
+    assert "configuration is valid" in output
+    assert "2 instances" in output
+    assert "1 rules" in output
+
+
+def test_validate_reports_every_error_with_a_location(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_config(
+        workspace,
+        {
+            "instances": {"Porch Mail": {"plugin": "no-such-plugin"}},
+            "rules": {"R": {"inputs": ["Ghost"], "outputs": ["Ghost"]}},
+        },
+    )
+    assert main(_argv(workspace, "validate")) == EXIT_CONFIG_ERROR
+
+    errors = capsys.readouterr().err
+    assert "unknown plugin" in errors
+    assert "10-all.json:" in errors
+    assert "configuration errors" in errors
+
+
+def test_validate_reports_a_missing_required_setting(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_config(workspace, {"instances": {"Porch Mail": {"plugin": "probe-input"}}})
+    assert main(_argv(workspace, "validate")) == EXIT_CONFIG_ERROR
+    assert "trigger_file" in capsys.readouterr().err
+
+
+def test_validate_refuses_readable_secrets(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _valid_config(workspace)
+    secrets = workspace["root"] / "secrets.json"
+    secrets.write_text(json.dumps({"pw": "x"}), encoding="utf-8")
+    secrets.chmod(0o644)
+
+    assert main(_argv(workspace, "validate")) == EXIT_CONFIG_ERROR
+    assert "chmod 0600" in capsys.readouterr().err
+
+
+def test_validate_warns_about_broken_plugins_without_failing(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    broken = workspace["plugins"] / "broken"
+    broken.mkdir()
+    (broken / "__init__.py").write_text("raise RuntimeError('nope')\n", encoding="utf-8")
+    _valid_config(workspace)
+
+    assert main(_argv(workspace, "validate")) == EXIT_OK
+    captured = capsys.readouterr()
+    assert "warning: plugin at" in captured.err
+    assert "configuration is valid" in captured.out
