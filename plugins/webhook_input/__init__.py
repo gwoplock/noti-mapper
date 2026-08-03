@@ -114,3 +114,143 @@ class WebhookInput(InputPlugin):
         self._detail = "not yet listening"
         self._accepted = 0
         self._rejected = 0
+
+    def catch_up(self, since: datetime.datetime | None) -> list[ObservedEvent]:
+        """Nothing to catch up on: a webhook that arrived while we were down is gone."""
+        del since
+        return []
+
+    # -- request handling -----------------------------------------------------
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    @property
+    def max_body_bytes(self) -> int:
+        return self._max_body
+
+    def authorized(self, presented: str | None) -> bool:
+        """Constant-time comparison, so the secret cannot be guessed byte by byte."""
+        if presented is None:
+            return False
+        return hmac.compare_digest(presented, self._secret)
+
+    def header_name(self) -> str:
+        return self._header
+
+    def accept(self, *, body: bytes, source: str) -> None:
+        metadata = {
+            "source": source,
+            "body": body.decode("utf-8", errors="replace"),
+        }
+        parsed = _parse_json(body)
+        if parsed is not None:
+            for key, value in parsed.items():
+                metadata[f"json.{key}"] = str(value)
+
+        with self._state_lock:
+            self._accepted += 1
+
+        self._log.info(
+            "webhook accepted from %s",
+            source,
+            extra={"instance": self.context.instance_name, "source": source},
+        )
+        self.emit(
+            ObservedEvent(occurred_at=self.context.clock.now(), metadata=clamp_metadata(metadata))
+        )
+
+    def reject(self, *, reason: str, source: str) -> None:
+        with self._state_lock:
+            self._rejected += 1
+        self._log.warning(
+            "webhook rejected from %s: %s",
+            source,
+            reason,
+            extra={"instance": self.context.instance_name, "source": source},
+        )
+
+
+def _parse_json(body: bytes) -> dict[str, object] | None:
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return {str(key): value for key, value in parsed.items()}
+
+
+def _make_handler(plugin: WebhookInput) -> type[http.server.BaseHTTPRequestHandler]:
+    """Build a handler class bound to one plugin instance.
+
+    ``http.server`` instantiates the handler per request and gives it no place
+    to carry state, so the instance is closed over here. This is the one place
+    in the codebase where a class is built at runtime, and it is because the
+    standard library's interface leaves no alternative.
+    """
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "noti-mapper"
+        sys_version = ""
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:  # noqa: N802 - http.server dictates this name
+            source = self.client_address[0]
+
+            if self.path != plugin.path:
+                plugin.reject(reason=f"unknown path {self.path!r}", source=source)
+                self._respond(404, "not found")
+                return
+
+            if not plugin.authorized(self.headers.get(plugin.header_name())):
+                plugin.reject(reason="missing or incorrect shared secret", source=source)
+                self._respond(401, "unauthorized")
+                return
+
+            length = self._content_length()
+            if length is None:
+                plugin.reject(reason="missing or malformed Content-Length", source=source)
+                self._respond(411, "length required")
+                return
+            if length > plugin.max_body_bytes:
+                plugin.reject(reason=f"body of {length} bytes is too large", source=source)
+                self._respond(413, "payload too large")
+                return
+
+            body = self.rfile.read(length)
+            plugin.accept(body=body, source=source)
+            self._respond(204, "")
+
+        def do_GET(self) -> None:  # noqa: N802 - http.server dictates this name
+            plugin.reject(reason="GET is not accepted", source=self.client_address[0])
+            self._respond(405, "method not allowed")
+
+        def _content_length(self) -> int | None:
+            raw = self.headers.get("Content-Length")
+            if raw is None:
+                return None
+            try:
+                length = int(raw)
+            except ValueError:
+                return None
+            if length < 0:
+                return None
+            return length
+
+        def _respond(self, status: int, message: str) -> None:
+            payload = message.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            if payload:
+                self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            # http.server logs to stderr directly; route it through the plugin's
+            # logger so it lands in the journal like everything else.
+            plugin.context.logger.debug(format, *args)
+
+    return Handler
