@@ -103,3 +103,62 @@ def test_the_reconciliation_matrix(persisted: bool, event_key: str, report_key: 
 
 def test_the_matrix_is_complete() -> None:
     assert len(_MATRIX) == 2 * len(_EVENTS) * len(_REPORTS)
+
+
+# -- the case that matters most -----------------------------------------------
+
+
+def test_cleared_remotely_then_a_new_event_re_sets_the_latch() -> None:
+    outcome = resolve_rule(
+        now=NOW,
+        persisted=_latch(state=True, set_at=BEFORE_CLEAR),
+        latest_downtime_event=AFTER_CLEAR,
+        output_reports=[CLEARED],
+    )
+    assert outcome.state is True
+    assert outcome.set_at == AFTER_CLEAR
+    assert outcome.cleared_at == CLEAR_TIME
+    assert "later event" in outcome.reason
+
+
+def test_cleared_remotely_after_the_event_leaves_it_cleared() -> None:
+    outcome = resolve_rule(
+        now=NOW,
+        persisted=_latch(state=True, set_at=BEFORE_CLEAR),
+        latest_downtime_event=BEFORE_CLEAR,
+        output_reports=[CLEARED],
+    )
+    assert outcome.state is False
+    assert outcome.cleared_at == CLEAR_TIME
+
+
+def test_an_event_exactly_at_the_clear_time_does_not_re_set() -> None:
+    outcome = resolve_rule(
+        now=NOW,
+        persisted=_latch(state=True),
+        latest_downtime_event=CLEAR_TIME,
+        output_reports=[CLEARED],
+    )
+    assert outcome.state is False
+
+
+def test_a_clear_with_no_timestamp_loses_to_any_event() -> None:
+    outcome = resolve_rule(
+        now=NOW,
+        persisted=_latch(state=True),
+        latest_downtime_event=BEFORE_CLEAR,
+        output_reports=[CLEARED_UNDATED],
+    )
+    assert outcome.state is True
+    assert outcome.set_at == BEFORE_CLEAR
+
+
+def test_a_clear_with_no_timestamp_and_no_event_clears() -> None:
+    outcome = resolve_rule(
+        now=NOW,
+        persisted=_latch(state=True),
+        latest_downtime_event=None,
+        output_reports=[CLEARED_UNDATED],
+    )
+    assert outcome.state is False
+    assert outcome.cleared_at == NOW
