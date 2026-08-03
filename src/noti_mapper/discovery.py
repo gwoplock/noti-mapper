@@ -27,11 +27,11 @@ import inspect
 import logging
 import sys
 import traceback
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from noti_mapper.config import PluginDirection
+from noti_mapper.config import KnownPlugin, PluginDirection
 from noti_mapper.plugin import InputPlugin, OutputPlugin
 
 PACKAGED_PLUGIN_DIRECTORY: Path = Path("/usr/lib/noti-mapper/plugins")
@@ -159,6 +159,39 @@ def discover(
             )
 
     return DiscoveryResult(plugins=plugins, failures=tuple(failures))
+
+
+def known_plugins(result: DiscoveryResult) -> dict[str, KnownPlugin]:
+    """Convert a discovery result into what configuration validation needs."""
+    known: dict[str, KnownPlugin] = {}
+    for name, plugin in result.plugins.items():
+        known[name] = KnownPlugin(
+            plugin_name=name,
+            directions=plugin.directions(),
+            validate_settings=_settings_validator(plugin),
+        )
+    return known
+
+
+def _settings_validator(plugin: LoadedPlugin) -> Callable[[Mapping[str, object]], list[str]]:
+    """Build the callable configuration validation uses for one plugin.
+
+    A plugin providing both directions gets both validators run, with the
+    problems concatenated. That is rare, but silently running only one of them
+    would be worse than the small cost of handling it.
+    """
+
+    def validate(settings: Mapping[str, object]) -> list[str]:
+        problems: list[str] = []
+        if plugin.input_class is not None:
+            problems.extend(plugin.input_class.validate_settings(settings))
+        if plugin.output_class is not None:
+            for problem in plugin.output_class.validate_settings(settings):
+                if problem not in problems:
+                    problems.append(problem)
+        return problems
+
+    return validate
 
 
 def _looks_like_a_plugin(candidate: Path) -> bool:
