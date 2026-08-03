@@ -12,6 +12,8 @@ from noti_mapper.storage import (
     Database,
     InstanceRecord,
     LatchRecord,
+    OutputStateRecord,
+    PendingPush,
     PluginKeyValueStore,
     RuleRecord,
     StorageError,
@@ -354,6 +356,95 @@ def test_purge_removes_orphans_and_leaves_live_objects(store: Store) -> None:
     assert store.latch("Live") is not None
     assert [rule.name for rule in store.rules()] == ["Live"]
     assert kv.get("last_uid") is None
+
+
+# -- output state -------------------------------------------------------------
+
+
+def test_output_state_round_trips(store: Store) -> None:
+    store.write_output_state(
+        OutputStateRecord(
+            instance_name="Lamp", last_applied=True, last_confirmed=None, last_sync_at=MOMENT
+        )
+    )
+    record = store.output_state("Lamp")
+    assert record is not None
+    assert record.last_applied is True
+    assert record.last_confirmed is None
+    assert record.last_sync_at == MOMENT
+
+    store.write_output_state(
+        OutputStateRecord(
+            instance_name="Lamp", last_applied=False, last_confirmed=False, last_sync_at=MOMENT
+        )
+    )
+    updated = store.output_state("Lamp")
+    assert updated is not None
+    assert updated.last_applied is False
+    assert updated.last_confirmed is False
+    assert len(store.output_states()) == 1
+
+
+# -- pending pushes -----------------------------------------------------------
+
+
+def test_pending_pushes_are_one_per_instance(store: Store) -> None:
+    store.write_pending_push(
+        PendingPush(
+            instance_name="Lamp",
+            target_value=True,
+            attempt_count=0,
+            next_attempt_at=MOMENT,
+            last_error=None,
+        )
+    )
+    store.write_pending_push(
+        PendingPush(
+            instance_name="Lamp",
+            target_value=False,
+            attempt_count=2,
+            next_attempt_at=MOMENT,
+            last_error="unreachable",
+        )
+    )
+
+    pushes = store.pending_pushes()
+    assert len(pushes) == 1
+    assert pushes[0].target_value is False
+    assert pushes[0].attempt_count == 2
+    assert pushes[0].last_error == "unreachable"
+
+
+def test_pending_pushes_due_filters_on_time(store: Store) -> None:
+    later = MOMENT + datetime.timedelta(minutes=5)
+    store.write_pending_push(
+        PendingPush(
+            instance_name="Now",
+            target_value=True,
+            attempt_count=0,
+            next_attempt_at=MOMENT,
+            last_error=None,
+        )
+    )
+    store.write_pending_push(
+        PendingPush(
+            instance_name="Later",
+            target_value=True,
+            attempt_count=0,
+            next_attempt_at=later,
+            last_error=None,
+        )
+    )
+
+    due = store.pending_pushes_due(MOMENT)
+    assert [push.instance_name for push in due] == ["Now"]
+    assert len(store.pending_pushes_due(later)) == 2
+    assert store.earliest_pending_attempt() == MOMENT
+
+    store.delete_pending_push("Now")
+    assert store.earliest_pending_attempt() == later
+    store.delete_pending_push("Later")
+    assert store.earliest_pending_attempt() is None
 
 
 # -- plugin key/value ---------------------------------------------------------
