@@ -18,6 +18,12 @@ authors = [{ name = "Garrett Battaglia" }]
 # the library is absent. The core itself uses only the standard library.
 dependencies = []
 
+[project.optional-dependencies]
+# Only for running the test suite and the type checker against the shipped
+# plugins. Packaging declares these as system packages instead; see
+# packaging/aur/. Nothing in src/noti_mapper imports them.
+plugins = ["imapclient>=3.0", "HAP-python>=4.9"]
+
 [project.scripts]
 noti-mapper = "noti_mapper.cli:main"
 
@@ -47,15 +53,20 @@ ignore = [
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"
 
+[tool.ruff.lint.per-file-ignores]
+# A plugin directory is loaded by path under a synthetic module name, so its
+# own submodules cannot be reached by any absolute name that is also correct
+# for the type checker and the test suite. Relative imports resolve correctly
+# under all three. This is the concrete reason the style guide asks for.
+"plugins/**" = ["TID252"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
 warn_unreachable = true
 disallow_any_unimported = true
 mypy_path = "src"
-# "plugins" is added to this list once the first plugin lands; mypy treats a
-# directory with no Python files in it as an error.
-files = ["src", "tests"]
+files = ["src", "tests", "plugins"]
 
 [[tool.mypy.overrides]]
 # Third-party plugin libraries ship no type information.
@@ -64,5 +75,5 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "."]
+pythonpath = ["src", "plugins", "."]
 filterwarnings = ["error"]

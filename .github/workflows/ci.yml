@@ -16,7 +16,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install tooling
-        run: python -m pip install --upgrade pip mypy ruff black pytest pytest-cov
+        run: |
+          python -m pip install --upgrade pip mypy ruff black pytest pytest-cov
+          python -m pip install -e '.[plugins]'
 
       - name: black --check
         run: black --check .
