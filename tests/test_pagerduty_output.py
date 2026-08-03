@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 
 from noti_mapper.clock import ManualClock
-from noti_mapper.plugin import OutputUpdate, PluginError
-from noti_mapper.storage import Database, database_path, initialize
+from noti_mapper.plugin import OutputUpdate, PluginError, RemoteBelief
+from noti_mapper.storage import Database, HealthStatus, database_path, initialize
 from pagerduty_output import PagerDutyOutput
 from tests.support import make_context
 
@@ -228,6 +228,78 @@ def test_an_unreachable_endpoint_raises(tmp_path: Path) -> None:
             plugin.apply(_update())
     finally:
         database.close()
+
+
+# -- the reverse direction ----------------------------------------------------
+
+
+def test_an_open_incident_reports_active(harness: Harness) -> None:
+    harness.stub.state.incidents = [{"status": "triggered"}]
+    state = harness.plugin.query()
+    assert state.belief is RemoteBelief.ACTIVE
+
+
+def test_an_acknowledged_incident_is_still_active(harness: Harness) -> None:
+    harness.stub.state.incidents = [{"status": "acknowledged"}]
+    assert harness.plugin.query().belief is RemoteBelief.ACTIVE
+
+
+def test_a_resolved_incident_reports_cleared_with_its_time(harness: Harness) -> None:
+    harness.stub.state.incidents = [{"status": "resolved", "resolved_at": "2026-03-01T14:30:00Z"}]
+    state = harness.plugin.query()
+    assert state.belief is RemoteBelief.CLEARED
+    assert state.cleared_at == RESOLVED_AT
+
+
+def test_the_most_recent_resolution_time_is_reported(harness: Harness) -> None:
+    harness.stub.state.incidents = [
+        {"status": "resolved", "resolved_at": "2026-03-01T09:00:00Z"},
+        {"status": "resolved", "resolved_at": "2026-03-01T14:30:00Z"},
+    ]
+    assert harness.plugin.query().cleared_at == RESOLVED_AT
+
+
+def test_last_status_change_is_used_when_resolved_at_is_absent(harness: Harness) -> None:
+    harness.stub.state.incidents = [
+        {"status": "resolved", "last_status_change_at": "2026-03-01T14:30:00Z"}
+    ]
+    assert harness.plugin.query().cleared_at == RESOLVED_AT
+
+
+def test_an_open_incident_beats_a_resolved_one(harness: Harness) -> None:
+    harness.stub.state.incidents = [
+        {"status": "resolved", "resolved_at": "2026-03-01T09:00:00Z"},
+        {"status": "triggered"},
+    ]
+    assert harness.plugin.query().belief is RemoteBelief.ACTIVE
+
+
+def test_no_incident_at_all_reports_unknown_not_cleared(harness: Harness) -> None:
+    """Never having alerted is not the same as having been cleared."""
+    harness.stub.state.incidents = []
+    assert harness.plugin.query().belief is RemoteBelief.UNKNOWN
+
+
+def test_an_api_error_reports_unknown_rather_than_raising(harness: Harness) -> None:
+    harness.stub.state.incidents_status = 401
+    state = harness.plugin.query()
+    assert state.belief is RemoteBelief.UNKNOWN
+    assert harness.plugin.health().status is HealthStatus.DEGRADED
+
+
+def test_a_non_json_api_response_reports_unknown(harness: Harness) -> None:
+    harness.stub.state.incidents_body = "<html>gateway timeout</html>"
+    assert harness.plugin.query().belief is RemoteBelief.UNKNOWN
+
+
+def test_the_query_uses_the_dedup_key_and_the_rest_token(harness: Harness) -> None:
+    harness.stub.state.incidents = [{"status": "triggered"}]
+    harness.plugin.query()
+
+    assert "incident_key=noti-mapper" in harness.stub.state.incident_queries[0]
+    headers = harness.stub.state.incident_headers[0]
+    assert headers["Authorization"] == "Token token=AP1T0K3N"
+    assert "vnd.pagerduty+json" in headers["Accept"]
 
 
 def test_the_events_api_is_not_sent_the_rest_token(harness: Harness) -> None:
