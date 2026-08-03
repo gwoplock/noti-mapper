@@ -145,6 +145,56 @@ class PagerDutyOutput(OutputPlugin):
     def dedup_key(self) -> str:
         return self._dedup_key
 
+    # -- HTTP -----------------------------------------------------------------
+
+    def _post(self, url: str, payload: Mapping[str, object]) -> dict[str, object]:
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        return self._send(request)
+
+    def _get(self, url: str) -> dict[str, object]:
+        request = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "application/vnd.pagerduty+json;version=2",
+                "Authorization": f"Token token={self._api_token}",
+            },
+        )
+        return self._send(request)
+
+    def _send(self, request: urllib.request.Request) -> dict[str, object]:
+        try:
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as error:
+            with error:
+                detail = error.read().decode("utf-8", errors="replace")[:500]
+            raise PluginError(
+                f"PagerDuty returned {error.code} for {request.method} {request.full_url}: {detail}"
+            ) from error
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            raise PluginError(f"PagerDuty is unreachable: {error}") from error
+
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except ValueError as error:
+            raise PluginError(f"PagerDuty returned a body that is not JSON: {error}") from error
+        if not isinstance(parsed, dict):
+            return {}
+        return {str(key): value for key, value in parsed.items()}
+
+    def _set_health(self, status: HealthStatus, detail: str) -> None:
+        with self._state_lock:
+            self._status = status
+            self._detail = detail
+
 
 def _optional_str(value: object) -> str | None:
     if value is None:
