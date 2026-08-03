@@ -623,6 +623,116 @@ class Store:
 
         return (purged_rules, purged_instances)
 
+    # -- output state ---------------------------------------------------------
+
+    def output_state(self, instance_name: str) -> OutputStateRecord | None:
+        row = (
+            self._database.connection()
+            .execute("SELECT * FROM output_state WHERE instance_name = ?", (instance_name,))
+            .fetchone()
+        )
+        if row is None:
+            return None
+        return _output_state_from_row(row)
+
+    def output_states(self) -> list[OutputStateRecord]:
+        rows = (
+            self._database.connection()
+            .execute("SELECT * FROM output_state ORDER BY instance_name")
+            .fetchall()
+        )
+        records: list[OutputStateRecord] = []
+        for row in rows:
+            records.append(_output_state_from_row(row))
+        return records
+
+    def write_output_state(self, record: OutputStateRecord) -> None:
+        self._database.connection().execute(
+            """
+            INSERT INTO output_state (instance_name, last_applied, last_confirmed, last_sync_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(instance_name) DO UPDATE SET
+                last_applied = excluded.last_applied,
+                last_confirmed = excluded.last_confirmed,
+                last_sync_at = excluded.last_sync_at
+            """,
+            (
+                record.instance_name,
+                None if record.last_applied is None else int(record.last_applied),
+                None if record.last_confirmed is None else int(record.last_confirmed),
+                None if record.last_sync_at is None else to_iso(record.last_sync_at),
+            ),
+        )
+
+    # -- pending pushes -------------------------------------------------------
+
+    def write_pending_push(self, push: PendingPush) -> None:
+        """Insert or replace the pending push for an instance.
+
+        There is at most one per instance by construction, so a newer state
+        change always supersedes an older one rather than queueing behind it.
+        """
+        self._database.connection().execute(
+            """
+            INSERT INTO pending_pushes
+                (instance_name, target_value, attempt_count, next_attempt_at, last_error)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(instance_name) DO UPDATE SET
+                target_value = excluded.target_value,
+                attempt_count = excluded.attempt_count,
+                next_attempt_at = excluded.next_attempt_at,
+                last_error = excluded.last_error
+            """,
+            (
+                push.instance_name,
+                int(push.target_value),
+                push.attempt_count,
+                to_iso(push.next_attempt_at),
+                push.last_error,
+            ),
+        )
+
+    def delete_pending_push(self, instance_name: str) -> None:
+        self._database.connection().execute(
+            "DELETE FROM pending_pushes WHERE instance_name = ?", (instance_name,)
+        )
+
+    def pending_pushes(self) -> list[PendingPush]:
+        rows = (
+            self._database.connection()
+            .execute("SELECT * FROM pending_pushes ORDER BY next_attempt_at, instance_name")
+            .fetchall()
+        )
+        pushes: list[PendingPush] = []
+        for row in rows:
+            pushes.append(_pending_push_from_row(row))
+        return pushes
+
+    def pending_pushes_due(self, moment: datetime.datetime) -> list[PendingPush]:
+        rows = (
+            self._database.connection()
+            .execute(
+                "SELECT * FROM pending_pushes WHERE next_attempt_at <= ? "
+                "ORDER BY next_attempt_at, instance_name",
+                (to_iso(moment),),
+            )
+            .fetchall()
+        )
+        pushes: list[PendingPush] = []
+        for row in rows:
+            pushes.append(_pending_push_from_row(row))
+        return pushes
+
+    def earliest_pending_attempt(self) -> datetime.datetime | None:
+        row = (
+            self._database.connection()
+            .execute("SELECT MIN(next_attempt_at) AS soonest FROM pending_pushes")
+            .fetchone()
+        )
+        if row is None or row["soonest"] is None:
+            return None
+        return from_iso(str(row["soonest"]))
+
 
 class PluginKeyValueStore:
     """Durable per-instance scratch storage for plugins.
