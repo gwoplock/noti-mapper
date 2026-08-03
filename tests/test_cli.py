@@ -196,3 +196,75 @@ def test_validate_warns_about_broken_plugins_without_failing(
     captured = capsys.readouterr()
     assert "warning: plugin at" in captured.err
     assert "configuration is valid" in captured.out
+
+
+# -- status -------------------------------------------------------------------
+
+
+def test_status_without_a_database_says_so(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(_argv(workspace, "status")) == EXIT_FAILURE
+    assert "has the daemon ever run" in capsys.readouterr().out
+
+
+def test_status_prints_latches_outputs_and_events(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _valid_config(workspace)
+    _seed_state(workspace)
+
+    assert main(_argv(workspace, "status")) == EXIT_OK
+    output = capsys.readouterr().out
+
+    assert "Latches" in output
+    assert "'Package On Porch'" in output
+    assert "SET" in output
+    assert "triggers=3" in output
+    assert "cause=Porch Mail" in output
+
+    assert "Outputs" in output
+    assert "desired=True" in output
+    assert "Pending retries" in output
+    assert "Plugin health" in output
+
+
+def test_status_flags_an_output_that_is_out_of_sync(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _valid_config(workspace)
+    _seed_state(workspace)
+
+    assert main(_argv(workspace, "status")) == EXIT_OK
+    assert "out of sync" in capsys.readouterr().out
+
+
+def test_status_lists_orphans(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _valid_config(workspace)
+    _seed_state(workspace)
+
+    database = Database(path=database_path(workspace["state"]))
+    try:
+        initialize(database)
+        Store(database=database).sync_rules([])
+    finally:
+        database.close()
+
+    assert main(_argv(workspace, "status")) == EXIT_OK
+    output = capsys.readouterr().out
+    assert "Orphaned rules" in output
+    assert "noti-mapper purge" in output
+
+
+def test_status_still_works_when_the_configuration_is_broken(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_config(workspace, {"instances": {"Porch Mail": {"plugin": "gone"}}})
+    _seed_state(workspace)
+
+    assert main(_argv(workspace, "status")) == EXIT_OK
+    output = capsys.readouterr().out
+    assert "does not currently load" in output
+    assert "'Package On Porch'" in output

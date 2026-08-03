@@ -18,6 +18,7 @@ these by hand: ``noti-mapper rename "Package On Porch" "Porch Package"``.
 """
 
 import argparse
+import datetime
 import logging
 import os
 import sys
@@ -28,17 +29,23 @@ from noti_mapper import VERSION
 from noti_mapper.clock import SystemClock
 from noti_mapper.config import (
     DEFAULT_CONFIG_DIRECTORY,
+    Configuration,
     ConfigurationError,
     load_configuration,
 )
 from noti_mapper.discovery import default_search_path, discover, known_plugins
 from noti_mapper.logging_setup import configure as configure_logging
 from noti_mapper.logging_setup import level_from_name
+from noti_mapper.rules import RuleGraph
 from noti_mapper.runtime import Daemon, Paths, StartupError
-from noti_mapper.secrets import DEFAULT_SECRETS_PATH, SecretsError, load_secrets
+from noti_mapper.secrets import DEFAULT_SECRETS_PATH, SecretsError, empty_store, load_secrets
 from noti_mapper.storage import (
     DEFAULT_STATE_DIRECTORY,
+    Database,
     StorageError,
+    Store,
+    database_path,
+    initialize,
 )
 
 STATE_DIRECTORY_ENVIRONMENT = "STATE_DIRECTORY"
@@ -219,3 +226,151 @@ def _validate(paths: Paths) -> int:
         f"{len(configuration.files)} file(s)"
     )
     return EXIT_OK
+
+
+# -- status -------------------------------------------------------------------
+
+
+def _status(paths: Paths) -> int:
+    path = database_path(paths.state_directory)
+    if not path.exists():
+        print(f"noti-mapper: no state database at {path}; has the daemon ever run?")
+        return EXIT_FAILURE
+
+    database = Database(path=path)
+    try:
+        initialize(database)
+    except StorageError as error:
+        print(f"noti-mapper: {error}", file=sys.stderr)
+        database.close()
+        return EXIT_FAILURE
+
+    store = Store(database=database)
+    try:
+        configuration = _configuration_or_none(paths)
+        _print_status(store=store, configuration=configuration, now=SystemClock().now())
+    finally:
+        database.close()
+    return EXIT_OK
+
+
+def _configuration_or_none(paths: Paths) -> Configuration | None:
+    discovery = discover(search_path=list(paths.plugin_directories), logger=logging.getLogger())
+    try:
+        secrets = load_secrets(paths.secrets_path)
+    except SecretsError:
+        secrets = empty_store(paths.secrets_path)
+    try:
+        return load_configuration(
+            config_directory=paths.config_directory,
+            secrets=secrets,
+            known_plugins=known_plugins(discovery),
+        )
+    except ConfigurationError:
+        return None
+
+
+def _print_status(
+    *, store: Store, configuration: Configuration | None, now: datetime.datetime
+) -> None:
+    graph = None if configuration is None else RuleGraph.from_configuration(configuration)
+    if configuration is None:
+        print(
+            "warning: the configuration does not currently load, so desired output "
+            "state cannot be computed. Run 'noti-mapper validate' for the errors.\n"
+        )
+
+    rules = {record.name: record for record in store.rules()}
+    latches = store.latches()
+
+    print("Latches")
+    if not latches:
+        print("  (none)")
+    for latch in latches:
+        rule = rules.get(latch.rule_name)
+        orphaned = " [orphaned]" if rule is not None and rule.orphaned else ""
+        disabled = " [disabled]" if rule is not None and not rule.enabled else ""
+        state = "SET " if latch.state else "clear"
+        when = latch.set_at if latch.state else latch.cleared_at
+        stamp = "never" if when is None else _ago(when, now)
+        print(
+            f"  {state}  {latch.rule_name!r}{orphaned}{disabled}  "
+            f"triggers={latch.trigger_count}  {stamp}  cause={latch.last_cause or '-'}"
+        )
+
+    orphans = [record.name for record in store.rules() if record.orphaned]
+    if orphans:
+        print("\nOrphaned rules (no longer in configuration; 'noti-mapper purge' clears them)")
+        for name in orphans:
+            print(f"  {name!r}")
+
+    print("\nOutputs")
+    states = {record.instance_name: record for record in store.output_states()}
+    output_names = sorted(states) if graph is None else graph.output_names()
+    if not output_names:
+        print("  (none)")
+    latch_states = {latch.rule_name: latch.state for latch in latches}
+    for name in output_names:
+        record = states.get(name)
+        applied = (
+            "unknown" if record is None or record.last_applied is None else str(record.last_applied)
+        )
+        synced = (
+            "never"
+            if record is None or record.last_sync_at is None
+            else _ago(record.last_sync_at, now)
+        )
+        if graph is None:
+            desired = "?"
+        else:
+            desired = str(graph.desired_output_state(instance_name=name, latches=latch_states))
+        agreement = "" if desired in {applied, "?"} else "   <-- out of sync"
+        print(f"  {name!r}  desired={desired}  applied={applied}  synced={synced}{agreement}")
+
+    print("\nPending retries")
+    pending = store.pending_pushes()
+    if not pending:
+        print("  (none)")
+    for push in pending:
+        print(
+            f"  {push.instance_name!r}  target={push.target_value}  "
+            f"attempts={push.attempt_count}  next={_ago(push.next_attempt_at, now)}  "
+            f"error={push.last_error or '-'}"
+        )
+
+    print("\nPlugin health")
+    health = store.health()
+    if not health:
+        print("  (none reported)")
+    for report in health:
+        detail = f"  {report.detail}" if report.detail else ""
+        print(
+            f"  {report.instance_name!r}  {report.status.value}  "
+            f"({_ago(report.updated_at, now)}){detail}"
+        )
+
+    print("\nRecent events")
+    events = store.recent_events(limit=10)
+    if not events:
+        print("  (none)")
+    for entry in events:
+        subject = entry.rule_name or entry.instance_name or "-"
+        detail = f"  {entry.detail}" if entry.detail else ""
+        print(f"  {_ago(entry.at, now)}  {entry.kind.value}  {subject}{detail}")
+
+
+def _ago(moment: datetime.datetime, now: datetime.datetime) -> str:
+    seconds = (now - moment).total_seconds()
+    if seconds < 0:
+        return f"in {_duration(-seconds)}"
+    return f"{_duration(seconds)} ago"
+
+
+def _duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
