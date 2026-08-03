@@ -7,10 +7,12 @@ what to answer. No network, no real services.
 import datetime
 import logging
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 from noti_mapper.clock import Clock, ManualClock
+from noti_mapper.dispatcher import Dispatcher
+from noti_mapper.messages import PushResultMessage
 from noti_mapper.plugin import (
     EmitCallback,
     InputPlugin,
@@ -150,3 +152,59 @@ class FakeOutput(OutputPlugin):
             if not self.applied:
                 return None
             return self.applied[-1]
+
+
+class InlineDispatcher(Dispatcher):
+    """A dispatcher that applies on the calling thread.
+
+    Gives tests a deterministic ordering: dispatch() calls apply() and reports
+    the result before returning, so Engine.drain() settles in a bounded number
+    of rounds with no sleeping or polling.
+    """
+
+    def __init__(
+        self, *, outputs: Mapping[str, OutputPlugin], report: Callable[[PushResultMessage], None]
+    ) -> None:
+        self._outputs: dict[str, OutputPlugin] = dict(outputs)
+        self._report = report
+        self.dispatched: list[tuple[str, bool]] = []
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def set_outputs(self, outputs: Mapping[str, OutputPlugin]) -> None:
+        self._outputs = dict(outputs)
+
+    def dispatch(self, *, instance_name: str, value: bool) -> None:
+        self.dispatched.append((instance_name, value))
+        output = self._outputs.get(instance_name)
+        if output is None:
+            self._report(
+                PushResultMessage(
+                    instance_name=instance_name,
+                    pushed_value=value,
+                    succeeded=False,
+                    error="output instance is no longer configured",
+                )
+            )
+            return
+        try:
+            output.apply(value)
+        except Exception as error:
+            self._report(
+                PushResultMessage(
+                    instance_name=instance_name,
+                    pushed_value=value,
+                    succeeded=False,
+                    error=f"{type(error).__name__}: {error}",
+                )
+            )
+            return
+        self._report(
+            PushResultMessage(instance_name=instance_name, pushed_value=value, succeeded=True)
+        )
