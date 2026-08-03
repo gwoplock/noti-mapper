@@ -4,6 +4,8 @@ The near-miss negatives matter more than the positives. A rule that fires on
 "Out for delivery" twice a day is how this project gets uninstalled.
 """
 
+import datetime
+
 import pytest
 
 from imap_input.matching import Criteria, compile_problems, decode_subject, sender_address
@@ -226,3 +228,54 @@ def test_the_idle_refresh_default_is_below_the_rfc_guidance() -> None:
 def test_compile_problems_reports_only_bad_patterns() -> None:
     assert compile_problems(["^ok$", "also ok"]) == []
     assert len(compile_problems(["(", "^fine$", "["])) == 2
+
+
+# -- message timestamps -------------------------------------------------------
+
+
+def test_the_message_date_is_preferred_over_the_time_we_noticed() -> None:
+    from imap_input import _message_date
+
+    class Envelope:
+        date = datetime.datetime(2026, 3, 1, 9, 0, tzinfo=datetime.UTC)
+
+    fallback = datetime.datetime(2026, 3, 1, 18, 0, tzinfo=datetime.UTC)
+    assert _message_date(envelope=Envelope(), internal_date=None, fallback=fallback) == (
+        Envelope.date
+    )
+
+
+def test_a_naive_message_date_is_treated_as_utc() -> None:
+    from imap_input import _message_date
+
+    class Envelope:
+        date = datetime.datetime(2026, 3, 1, 9, 0)
+
+    result = _message_date(
+        envelope=Envelope(),
+        internal_date=None,
+        fallback=datetime.datetime(2026, 3, 1, 18, 0, tzinfo=datetime.UTC),
+    )
+    assert result.tzinfo is not None
+    assert result.hour == 9
+
+
+def test_internal_date_is_the_fallback_before_the_clock() -> None:
+    from imap_input import _message_date
+
+    class Envelope:
+        date = None
+
+    internal = datetime.datetime(2026, 3, 1, 10, 0, tzinfo=datetime.UTC)
+    fallback = datetime.datetime(2026, 3, 1, 18, 0, tzinfo=datetime.UTC)
+    assert _message_date(envelope=Envelope(), internal_date=internal, fallback=fallback) == internal
+
+
+def test_with_no_dates_at_all_the_clock_wins() -> None:
+    from imap_input import _message_date
+
+    class Envelope:
+        date = None
+
+    fallback = datetime.datetime(2026, 3, 1, 18, 0, tzinfo=datetime.UTC)
+    assert _message_date(envelope=Envelope(), internal_date=None, fallback=fallback) == fallback
