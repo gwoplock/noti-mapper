@@ -59,6 +59,32 @@ def _errors(
     return [str(error) for error in caught.value.errors]
 
 
+def test_redefining_a_name_in_a_later_file_is_an_error(tmp_path: Path) -> None:
+    _write(tmp_path, "10-a.json", {"instances": {"Porch Mail": {"plugin": "imap-input"}}})
+    _write(tmp_path, "20-b.json", {"instances": {"Porch Mail": {"plugin": "webhook-input"}}})
+
+    errors = _errors(tmp_path)
+    assert len(errors) == 1
+    assert "duplicate instance name 'Porch Mail'" in errors[0]
+    assert "10-a.json:3:5" in errors[0]
+    assert "20-b.json" in errors[0]
+
+
+def test_duplicate_names_are_detected_case_insensitively(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {"instances": {"Porch Mail": {"plugin": "imap-input"}}},
+    )
+    _write(
+        tmp_path,
+        "b.json",
+        {"instances": {"porch mail": {"plugin": "imap-input"}}},
+    )
+    errors = _errors(tmp_path)
+    assert any("case-insensitively" in error for error in errors)
+
+
 def test_a_missing_config_directory_is_an_error(tmp_path: Path) -> None:
     errors = _errors(tmp_path / "absent")
     assert len(errors) == 1
@@ -80,6 +106,15 @@ def test_malformed_json_reports_file_and_line(tmp_path: Path) -> None:
     assert "bad.json:2:17" in errors[0]
 
 
+def test_one_bad_file_does_not_hide_errors_in_another(tmp_path: Path) -> None:
+    tmp_path.joinpath("10-bad.json").write_text("{", encoding="utf-8")
+    _write(tmp_path, "20-also-bad.json", {"instances": {"A": {"plugin": "nope"}}})
+    errors = _errors(tmp_path)
+    assert len(errors) == 2
+    assert "10-bad.json" in errors[0]
+    assert "20-also-bad.json" in errors[1]
+
+
 def test_unknown_top_level_key_is_an_error(tmp_path: Path) -> None:
     _write(tmp_path, "a.json", {"instance": {}})
     errors = _errors(tmp_path)
@@ -92,7 +127,44 @@ def test_top_level_must_be_an_object(tmp_path: Path) -> None:
     assert "must be an object" in errors[0]
 
 
+def test_unknown_instance_key_is_an_error(tmp_path: Path) -> None:
+    _write(tmp_path, "a.json", {"instances": {"A": {"plugin": "imap-input", "conifg": {}}}})
+    errors = _errors(tmp_path)
+    assert any("unknown key 'conifg'" in error for error in errors)
+
+
 def test_invalid_name_characters_are_rejected(tmp_path: Path) -> None:
     _write(tmp_path, "a.json", {"instances": {"Porch/Mail": {"plugin": "imap-input"}}})
     errors = _errors(tmp_path)
     assert "disallowed characters" in errors[0]
+
+
+def test_unknown_plugin_lists_the_plugins_that_loaded(tmp_path: Path) -> None:
+    _write(tmp_path, "a.json", {"instances": {"A": {"plugin": "imap"}}})
+    errors = _errors(tmp_path)
+    assert "unknown plugin 'imap'" in errors[0]
+    assert "imap-input" in errors[0]
+
+
+def test_unknown_plugin_with_no_plugins_loaded(tmp_path: Path) -> None:
+    _write(tmp_path, "a.json", {"instances": {"A": {"plugin": "imap"}}})
+    errors = _errors(tmp_path, known={})
+    assert "(none loaded)" in errors[0]
+
+
+def test_missing_plugin_field_is_an_error(tmp_path: Path) -> None:
+    _write(tmp_path, "a.json", {"instances": {"A": {"config": {}}}})
+    errors = _errors(tmp_path)
+    assert 'has no "plugin"' in errors[0]
+
+
+def test_config_must_be_an_object(tmp_path: Path) -> None:
+    _write(tmp_path, "a.json", {"instances": {"A": {"plugin": "imap-input", "config": []}}})
+    errors = _errors(tmp_path)
+    assert '"config" must be an object' in errors[0]
+
+
+def test_enabled_must_be_a_boolean(tmp_path: Path) -> None:
+    _write(tmp_path, "a.json", {"instances": {"A": {"plugin": "imap-input", "enabled": "yes"}}})
+    errors = _errors(tmp_path)
+    assert "must be true or false" in errors[0]

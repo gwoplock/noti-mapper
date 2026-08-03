@@ -17,6 +17,7 @@ from pathlib import Path
 from noti_mapper.jsonloc import (
     JsonObject,
     JsonParseError,
+    JsonScalar,
     Location,
     parse_file,
 )
@@ -323,6 +324,70 @@ class _Loader:
                 instances[instance.name] = instance
         return instances
 
+    def _build_instance(self, draft: _InstanceDraft) -> InstanceConfig | None:
+        self._reject_unknown_keys(
+            node=draft.node, allowed=_INSTANCE_KEYS, subject=f"instance {draft.name!r}"
+        )
+
+        plugin_name = self._require_string(
+            node=draft.node, key="plugin", subject=f"instance {draft.name!r}"
+        )
+        if plugin_name is None:
+            return None
+
+        known = self._known_plugins.get(plugin_name)
+        if known is None:
+            available = ", ".join(sorted(self._known_plugins)) or "(none loaded)"
+            self._errors.append(
+                ConfigError(
+                    f"instance {draft.name!r} refers to unknown plugin {plugin_name!r}. "
+                    f"Plugins that loaded: {available}",
+                    draft.node.key_locations["plugin"],
+                )
+            )
+            return None
+
+        enabled = self._optional_bool(
+            node=draft.node, key="enabled", default=True, subject=f"instance {draft.name!r}"
+        )
+
+        settings = self._build_settings(draft=draft, known=known)
+        if settings is None:
+            return None
+
+        return InstanceConfig(
+            name=draft.name,
+            plugin=plugin_name,
+            directions=known.directions,
+            settings=settings,
+            enabled=enabled,
+            origin=draft.origin,
+        )
+
+    def _build_settings(
+        self, *, draft: _InstanceDraft, known: KnownPlugin
+    ) -> Mapping[str, object] | None:
+        config_node = draft.node.members.get("config")
+        if config_node is None:
+            settings: Mapping[str, object] = {}
+        elif isinstance(config_node, JsonObject):
+            settings = self._resolve_secrets_object(config_node)
+        else:
+            self._errors.append(
+                ConfigError(
+                    f'instance {draft.name!r}: "config" must be an object',
+                    config_node.location,
+                )
+            )
+            return None
+
+        if known.validate_settings is not None:
+            location = draft.node.key_locations.get("config", draft.origin)
+            for problem in known.validate_settings(settings):
+                self._errors.append(ConfigError(f"instance {draft.name!r}: {problem}", location))
+
+        return settings
+
     # -- rules ----------------------------------------------------------------
 
     def _build_rules(self, instances: Mapping[str, InstanceConfig]) -> dict[str, RuleConfig]:
@@ -332,3 +397,41 @@ class _Loader:
             if rule is not None:
                 rules[rule.name] = rule
         return rules
+
+    # -- shared field helpers -------------------------------------------------
+
+    def _reject_unknown_keys(
+        self, *, node: JsonObject, allowed: tuple[str, ...], subject: str
+    ) -> None:
+        for key in node.members:
+            if key not in allowed:
+                self._errors.append(
+                    ConfigError(
+                        f"{subject}: unknown key {key!r}; expected one of "
+                        f"{', '.join(repr(name) for name in allowed)}",
+                        node.key_locations[key],
+                    )
+                )
+
+    def _require_string(self, *, node: JsonObject, key: str, subject: str) -> str | None:
+        member = node.members.get(key)
+        if member is None:
+            self._errors.append(ConfigError(f'{subject} has no "{key}"', node.location))
+            return None
+        if not isinstance(member, JsonScalar) or not isinstance(member.value, str):
+            self._errors.append(
+                ConfigError(f'{subject}: "{key}" must be a string', member.location)
+            )
+            return None
+        return member.value
+
+    def _optional_bool(self, *, node: JsonObject, key: str, default: bool, subject: str) -> bool:
+        member = node.members.get(key)
+        if member is None:
+            return default
+        if not isinstance(member, JsonScalar) or not isinstance(member.value, bool):
+            self._errors.append(
+                ConfigError(f'{subject}: "{key}" must be true or false', member.location)
+            )
+            return default
+        return member.value
