@@ -1,0 +1,152 @@
+"""Shared test doubles.
+
+Fake plugins that record what the core asked them to do and let a test decide
+what to answer. No network, no real services.
+"""
+
+import datetime
+import logging
+import threading
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+
+from noti_mapper.clock import Clock, ManualClock
+from noti_mapper.plugin import (
+    EmitCallback,
+    InputPlugin,
+    ObservedEvent,
+    OutputPlugin,
+    PluginContext,
+    PluginError,
+    PluginHealth,
+    RemoteBelief,
+    RemoteState,
+    UnlatchCallback,
+)
+from noti_mapper.storage import Database, HealthStatus, PluginKeyValueStore
+
+
+def make_context(
+    *,
+    instance_name: str,
+    database: Database,
+    settings: Mapping[str, object] | None = None,
+    clock: Clock | None = None,
+) -> PluginContext:
+    return PluginContext(
+        instance_name=instance_name,
+        settings={} if settings is None else settings,
+        storage=PluginKeyValueStore(database=database, instance_name=instance_name),
+        clock=clock if clock is not None else ManualClock(),
+        logger=logging.getLogger(f"test.plugin.{instance_name}"),
+    )
+
+
+@dataclass
+class FakeInputBehaviour:
+    """What a FakeInput should do when the core talks to it."""
+
+    catch_up_events: list[ObservedEvent] = field(default_factory=list)
+    catch_up_raises: Exception | None = None
+    health: PluginHealth = field(
+        default_factory=lambda: PluginHealth(status=HealthStatus.OK, detail="")
+    )
+
+
+class FakeInput(InputPlugin):
+    """An input that fires only when a test tells it to."""
+
+    def __init__(self, *, context: PluginContext, emit: EmitCallback) -> None:
+        super().__init__(context=context, emit=emit)
+        self._behaviour = FakeInputBehaviour()
+        self.started = False
+        self.stopped = False
+        self.catch_up_calls: list[datetime.datetime | None] = []
+        self._release = threading.Event()
+
+    def configure(self, behaviour: FakeInputBehaviour) -> None:
+        self._behaviour = behaviour
+
+    def start(self) -> None:
+        self.started = True
+        self._release.wait()
+
+    def stop(self) -> None:
+        self.stopped = True
+        self._release.set()
+
+    def health(self) -> PluginHealth:
+        return self._behaviour.health
+
+    def catch_up(self, since: datetime.datetime | None) -> list[ObservedEvent]:
+        self.catch_up_calls.append(since)
+        if self._behaviour.catch_up_raises is not None:
+            raise self._behaviour.catch_up_raises
+        return list(self._behaviour.catch_up_events)
+
+    def fire(self, *, at: datetime.datetime, metadata: Mapping[str, str] | None = None) -> None:
+        self.emit(ObservedEvent(occurred_at=at, metadata={} if metadata is None else metadata))
+
+
+@dataclass
+class FakeOutputBehaviour:
+    """What a FakeOutput should do when the core talks to it."""
+
+    apply_failures: int = 0
+    apply_always_fails: bool = False
+    query_result: RemoteState = field(
+        default_factory=lambda: RemoteState(belief=RemoteBelief.UNKNOWN)
+    )
+    query_raises: Exception | None = None
+    health: PluginHealth = field(
+        default_factory=lambda: PluginHealth(status=HealthStatus.OK, detail="")
+    )
+
+
+class FakeOutput(OutputPlugin):
+    """An output that records every apply and answers queries from a script."""
+
+    def __init__(self, *, context: PluginContext, request_unlatch: UnlatchCallback) -> None:
+        super().__init__(context=context, request_unlatch=request_unlatch)
+        self._behaviour = FakeOutputBehaviour()
+        self._lock = threading.Lock()
+        self.applied: list[bool] = []
+        self.started = False
+        self.stopped = False
+        self.query_calls = 0
+
+    def configure(self, behaviour: FakeOutputBehaviour) -> None:
+        with self._lock:
+            self._behaviour = behaviour
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def apply(self, state: bool) -> None:
+        with self._lock:
+            if self._behaviour.apply_always_fails:
+                raise PluginError(f"{self.context.instance_name} is unreachable")
+            if self._behaviour.apply_failures > 0:
+                self._behaviour.apply_failures -= 1
+                raise PluginError(f"{self.context.instance_name} is unreachable")
+            self.applied.append(state)
+
+    def query(self) -> RemoteState:
+        with self._lock:
+            self.query_calls += 1
+            if self._behaviour.query_raises is not None:
+                raise self._behaviour.query_raises
+            return self._behaviour.query_result
+
+    def health(self) -> PluginHealth:
+        with self._lock:
+            return self._behaviour.health
+
+    def last_applied(self) -> bool | None:
+        with self._lock:
+            if not self.applied:
+                return None
+            return self.applied[-1]
