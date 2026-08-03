@@ -3,6 +3,8 @@ import pytest
 from noti_mapper.names import (
     MAX_NAME_LENGTH,
     InvalidNameError,
+    NameRegistry,
+    Namespace,
     find_name_problems,
     normalize_name,
     uniqueness_key,
@@ -95,3 +97,52 @@ def test_uniqueness_key_normalizes_unicode_composition() -> None:
     decomposed = "Café"
     assert precomposed != decomposed
     assert uniqueness_key(precomposed) == uniqueness_key(decomposed)
+
+
+def test_registry_rejects_case_insensitive_duplicates() -> None:
+    registry = NameRegistry()
+    registry.register(name="Porch Mail", namespace=Namespace.INSTANCE, origin="a.json:2")
+
+    conflict = registry.find_conflict(name="porch mail", namespace=Namespace.INSTANCE)
+    assert conflict is not None
+    assert conflict.name == "Porch Mail"
+    assert conflict.origin == "a.json:2"
+
+    with pytest.raises(InvalidNameError, match="a.json:2"):
+        registry.register(name="porch mail", namespace=Namespace.INSTANCE, origin="b.json:5")
+
+
+def test_registry_namespaces_are_independent() -> None:
+    registry = NameRegistry()
+    registry.register(name="Porch Mail", namespace=Namespace.INSTANCE, origin="a.json:2")
+    registry.register(name="Porch Mail", namespace=Namespace.RULE, origin="a.json:9")
+
+    assert registry.names(Namespace.INSTANCE) == ["Porch Mail"]
+    assert registry.names(Namespace.RULE) == ["Porch Mail"]
+
+
+def test_registry_registers_the_stripped_form() -> None:
+    registry = NameRegistry()
+    registered = registry.register(
+        name="  Porch Mail  ", namespace=Namespace.INSTANCE, origin="a.json:2"
+    )
+    assert registered.name == "Porch Mail"
+    assert registry.names(Namespace.INSTANCE) == ["Porch Mail"]
+
+
+def test_resolve_requires_an_exact_match() -> None:
+    registry = NameRegistry()
+    registry.register(name="Porch Mail", namespace=Namespace.INSTANCE, origin="a.json:2")
+
+    assert registry.resolve(name="Porch Mail", namespace=Namespace.INSTANCE) is not None
+    assert registry.resolve(name="porch mail", namespace=Namespace.INSTANCE) is None
+    assert registry.resolve(name="Porch Mail", namespace=Namespace.RULE) is None
+
+
+def test_suggest_offers_the_case_correct_spelling() -> None:
+    registry = NameRegistry()
+    registry.register(name="Porch Mail", namespace=Namespace.INSTANCE, origin="a.json:2")
+
+    assert registry.suggest(name="porch mail", namespace=Namespace.INSTANCE) == "Porch Mail"
+    assert registry.suggest(name="Porch Mail", namespace=Namespace.INSTANCE) is None
+    assert registry.suggest(name="Kitchen Mail", namespace=Namespace.INSTANCE) is None

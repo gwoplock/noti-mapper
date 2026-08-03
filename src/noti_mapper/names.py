@@ -20,7 +20,9 @@ The rules, in one place so nothing else has to reimplement them:
   name with an instance without conflict.
 """
 
+import enum
 import unicodedata
+from dataclasses import dataclass
 
 MAX_NAME_LENGTH: int = 128
 
@@ -31,8 +33,24 @@ MAX_NAME_LENGTH: int = 128
 ALLOWED_PUNCTUATION: frozenset[str] = frozenset(" -_.")
 
 
+class Namespace(enum.Enum):
+    """Names live in one of two independent namespaces."""
+
+    INSTANCE = "instance"
+    RULE = "rule"
+
+
 class InvalidNameError(ValueError):
     """A name violates the naming rules."""
+
+
+@dataclass(frozen=True)
+class RegisteredName:
+    """A name that has been accepted into a registry, and where it came from."""
+
+    name: str
+    namespace: Namespace
+    origin: str
 
 
 def normalize_name(raw: str) -> str:
@@ -107,3 +125,60 @@ def validate_name(raw: str) -> str:
     if problems:
         raise InvalidNameError(f"{raw!r}: " + "; ".join(problems))
     return normalize_name(raw)
+
+
+class NameRegistry:
+    """Tracks which names have been used, per namespace.
+
+    Uniqueness is enforced case-insensitively. The registry also supports
+    looking a name up case-insensitively, which is used to turn "no such
+    instance" into "no such instance; did you mean ...".
+    """
+
+    def __init__(self) -> None:
+        self._by_namespace: dict[Namespace, dict[str, RegisteredName]] = {
+            namespace: {} for namespace in Namespace
+        }
+
+    def find_conflict(self, *, name: str, namespace: Namespace) -> RegisteredName | None:
+        """Return the already-registered name this one would collide with, if any."""
+        return self._by_namespace[namespace].get(uniqueness_key(normalize_name(name)))
+
+    def register(self, *, name: str, namespace: Namespace, origin: str) -> RegisteredName:
+        """Add a name to the registry.
+
+        The caller is expected to have checked :meth:`find_conflict` already and
+        reported a useful error; registering a conflicting name raises.
+        """
+        normalized = normalize_name(name)
+        key = uniqueness_key(normalized)
+        existing = self._by_namespace[namespace].get(key)
+        if existing is not None:
+            raise InvalidNameError(
+                f"{namespace.value} name {normalized!r} conflicts with "
+                f"{existing.name!r} defined at {existing.origin}"
+            )
+        registered = RegisteredName(name=normalized, namespace=namespace, origin=origin)
+        self._by_namespace[namespace][key] = registered
+        return registered
+
+    def resolve(self, *, name: str, namespace: Namespace) -> RegisteredName | None:
+        """Return the registered entry whose name matches exactly, if any."""
+        entry = self.find_conflict(name=name, namespace=namespace)
+        if entry is None:
+            return None
+        if entry.name != normalize_name(name):
+            return None
+        return entry
+
+    def suggest(self, *, name: str, namespace: Namespace) -> str | None:
+        """Return a registered name differing only by case, for error messages."""
+        entry = self.find_conflict(name=name, namespace=namespace)
+        if entry is None or entry.name == normalize_name(name):
+            return None
+        return entry.name
+
+    def names(self, namespace: Namespace) -> list[str]:
+        """Return every registered name in a namespace, sorted for stable output."""
+        entries = self._by_namespace[namespace].values()
+        return sorted(entry.name for entry in entries)
