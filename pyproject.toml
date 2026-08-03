@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "noti-mapper"
+version = "0.1.0"
+description = "Latch notification events from inputs onto outputs until explicitly acknowledged."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE.md"]
+requires-python = ">=3.11"
+authors = [{ name = "Garrett Battaglia" }]
+
+# Runtime dependencies are deliberately NOT listed here for the plugins.
+# Packaging declares system packages (see packaging/aur/); plugins that need a
+# third-party library import it lazily and are skipped with a logged error when
+# the library is absent. The core itself uses only the standard library.
+dependencies = []
+
+[project.scripts]
+noti-mapper = "noti_mapper.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/gwoplock/noti-mapper"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "plugins", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RET", "ARG", "PTH", "TID"]
+ignore = [
+    # A loop is often clearer than a comprehension in this codebase; see the
+    # code style section of the design document.
+    "SIM108",
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+disallow_any_unimported = true
+mypy_path = "src"
+# "plugins" is added to this list once the first plugin lands; mypy treats a
+# directory with no Python files in it as an error.
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+# Third-party plugin libraries ship no type information.
+module = ["imapclient.*", "pyhap.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+filterwarnings = ["error"]
