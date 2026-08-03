@@ -9,7 +9,9 @@ from noti_mapper.clock import from_iso, to_iso
 from noti_mapper.storage import (
     SCHEMA_VERSION,
     Database,
+    InstanceRecord,
     PluginKeyValueStore,
+    RuleRecord,
     StorageError,
     Store,
     database_path,
@@ -32,6 +34,14 @@ def database(tmp_path: Path) -> Iterator[Database]:
 def store(database: Database) -> Store:
     initialize(database)
     return Store(database=database)
+
+
+def _rule(name: str, inputs: tuple[str, ...], outputs: tuple[str, ...]) -> RuleRecord:
+    return RuleRecord(name=name, enabled=True, orphaned=False, inputs=inputs, outputs=outputs)
+
+
+def _instance(name: str, plugin: str = "imap-input") -> InstanceRecord:
+    return InstanceRecord(name=name, plugin=plugin, enabled=True, orphaned=False)
 
 
 # -- schema -------------------------------------------------------------------
@@ -81,6 +91,25 @@ def test_each_thread_gets_its_own_connection(store: Store) -> None:
 
     assert len(seen) == 1
     assert seen[0] != main
+
+
+def test_removing_an_instance_orphans_it_but_keeps_scratch_storage(store: Store) -> None:
+    store.sync_instances([_instance("Mail"), _instance("Lamp", "homekit-output")])
+    kv = PluginKeyValueStore(database=store.database, instance_name="Mail")
+    kv.set("last_uid", "4242")
+
+    newly_orphaned = store.sync_instances([_instance("Lamp", "homekit-output")])
+    assert newly_orphaned == ["Mail"]
+
+    by_name = {instance.name: instance for instance in store.instances()}
+    assert by_name["Mail"].orphaned is True
+    assert kv.get("last_uid") == "4242"
+
+
+def test_orphaning_is_reported_only_once(store: Store) -> None:
+    store.sync_rules([_rule("R", ("A",), ("B",))])
+    assert store.sync_rules([])[0] == ["R"]
+    assert store.sync_rules([])[0] == []
 
 
 # -- plugin key/value ---------------------------------------------------------
