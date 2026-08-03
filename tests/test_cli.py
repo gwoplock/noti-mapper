@@ -12,6 +12,7 @@ from noti_mapper.storage import (
     Database,
     InstanceRecord,
     LatchRecord,
+    PluginKeyValueStore,
     RuleRecord,
     Store,
     database_path,
@@ -315,3 +316,65 @@ def test_rename_without_a_database(
 ) -> None:
     assert main(_argv(workspace, "rename", "A", "B")) == EXIT_FAILURE
     assert "no state database" in capsys.readouterr().err
+
+
+# -- purge --------------------------------------------------------------------
+
+
+def test_purge_with_nothing_to_do(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_state(workspace)
+    assert main(_argv(workspace, "purge", "--yes")) == EXIT_OK
+    assert "nothing to purge" in capsys.readouterr().out
+
+
+def test_purge_deletes_orphans(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_state(workspace)
+
+    database = Database(path=database_path(workspace["state"]))
+    try:
+        store = Store(database=database)
+        PluginKeyValueStore(database=database, instance_name="Porch Mail").set("uid", "7")
+        store.sync_rules([])
+        store.sync_instances([])
+    finally:
+        database.close()
+
+    assert main(_argv(workspace, "purge", "--yes")) == EXIT_OK
+    output = capsys.readouterr().out
+    assert "This will permanently delete" in output
+    assert "purged 1 rule(s) and 2 instance(s)" in output
+
+    database = Database(path=database_path(workspace["state"]))
+    try:
+        store = Store(database=database)
+        assert store.latch("Package On Porch") is None
+        assert store.rules() == []
+        assert PluginKeyValueStore(database=database, instance_name="Porch Mail").get("uid") is None
+    finally:
+        database.close()
+
+
+def test_purge_refuses_to_guess_when_not_a_terminal(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_state(workspace)
+    database = Database(path=database_path(workspace["state"]))
+    try:
+        Store(database=database).sync_rules([])
+    finally:
+        database.close()
+
+    assert main(_argv(workspace, "purge")) == EXIT_OK
+    captured = capsys.readouterr()
+    assert "re-run with --yes" in captured.err
+    assert "cancelled" in captured.out
+
+    database = Database(path=database_path(workspace["state"]))
+    try:
+        assert Store(database=database).latch("Package On Porch") is not None
+    finally:
+        database.close()
