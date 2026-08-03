@@ -26,7 +26,7 @@ import datetime
 import enum
 import sqlite3
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -375,6 +375,122 @@ class Store:
     @property
     def database(self) -> Database:
         return self._database
+
+    # -- configuration mirror -------------------------------------------------
+
+    def sync_instances(self, instances: Sequence[InstanceRecord]) -> list[str]:
+        """Mirror the configured instances into the database.
+
+        Instances that configuration no longer defines are marked orphaned
+        rather than deleted: their ``plugin_kv`` scratch storage and
+        ``output_state`` stay put, so an instance that comes back does not have
+        to rebuild them. Returns the names newly marked orphaned.
+        """
+        present = {instance.name for instance in instances}
+        newly_orphaned: list[str] = []
+        with self._database.transaction() as transaction:
+            for instance in instances:
+                transaction.execute(
+                    """
+                    INSERT INTO instances (name, plugin, enabled, orphaned)
+                    VALUES (?, ?, ?, 0)
+                    ON CONFLICT(name) DO UPDATE SET
+                        plugin = excluded.plugin,
+                        enabled = excluded.enabled,
+                        orphaned = 0
+                    """,
+                    (instance.name, instance.plugin, int(instance.enabled)),
+                )
+            rows = transaction.execute("SELECT name FROM instances WHERE orphaned = 0").fetchall()
+            for row in rows:
+                name = str(row["name"])
+                if name not in present:
+                    transaction.execute("UPDATE instances SET orphaned = 1 WHERE name = ?", (name,))
+                    newly_orphaned.append(name)
+        return newly_orphaned
+
+    def sync_rules(self, rules: Sequence[RuleRecord]) -> tuple[list[str], list[str]]:
+        """Mirror the configured rules into the database.
+
+        A rule that configuration no longer defines is marked orphaned. Its
+        latch record persists and is re-adoptable if a rule with that name
+        returns, but it stops contributing to output state immediately.
+
+        Returns ``(newly_orphaned, readopted)``.
+        """
+        present = {rule.name for rule in rules}
+        newly_orphaned: list[str] = []
+        readopted: list[str] = []
+
+        with self._database.transaction() as transaction:
+            for rule in rules:
+                was_orphaned_row = transaction.execute(
+                    "SELECT orphaned FROM rules WHERE name = ?", (rule.name,)
+                ).fetchone()
+                if was_orphaned_row is not None and bool(was_orphaned_row["orphaned"]):
+                    readopted.append(rule.name)
+
+                transaction.execute(
+                    """
+                    INSERT INTO rules (name, enabled, orphaned) VALUES (?, ?, 0)
+                    ON CONFLICT(name) DO UPDATE SET
+                        enabled = excluded.enabled,
+                        orphaned = 0
+                    """,
+                    (rule.name, int(rule.enabled)),
+                )
+                transaction.execute(
+                    "INSERT OR IGNORE INTO latches (rule_name, state, trigger_count) "
+                    "VALUES (?, 0, 0)",
+                    (rule.name,),
+                )
+                transaction.execute("DELETE FROM rule_inputs WHERE rule_name = ?", (rule.name,))
+                transaction.execute("DELETE FROM rule_outputs WHERE rule_name = ?", (rule.name,))
+                for instance_name in rule.inputs:
+                    transaction.execute(
+                        "INSERT INTO rule_inputs (rule_name, instance_name) VALUES (?, ?)",
+                        (rule.name, instance_name),
+                    )
+                for instance_name in rule.outputs:
+                    transaction.execute(
+                        "INSERT INTO rule_outputs (rule_name, instance_name) VALUES (?, ?)",
+                        (rule.name, instance_name),
+                    )
+
+            rows = transaction.execute("SELECT name FROM rules WHERE orphaned = 0").fetchall()
+            for row in rows:
+                name = str(row["name"])
+                if name not in present:
+                    transaction.execute("UPDATE rules SET orphaned = 1 WHERE name = ?", (name,))
+                    newly_orphaned.append(name)
+
+        return (newly_orphaned, readopted)
+
+    def rules(self, *, include_orphaned: bool = True) -> list[RuleRecord]:
+        connection = self._database.connection()
+        clause = "" if include_orphaned else " WHERE orphaned = 0"
+        rows = connection.execute(f"SELECT * FROM rules{clause} ORDER BY name").fetchall()
+
+        inputs: dict[str, list[str]] = {}
+        outputs: dict[str, list[str]] = {}
+        for row in connection.execute("SELECT * FROM rule_inputs ORDER BY instance_name"):
+            inputs.setdefault(str(row["rule_name"]), []).append(str(row["instance_name"]))
+        for row in connection.execute("SELECT * FROM rule_outputs ORDER BY instance_name"):
+            outputs.setdefault(str(row["rule_name"]), []).append(str(row["instance_name"]))
+
+        records: list[RuleRecord] = []
+        for row in rows:
+            name = str(row["name"])
+            records.append(
+                RuleRecord(
+                    name=name,
+                    enabled=_as_bool(row["enabled"]),
+                    orphaned=_as_bool(row["orphaned"]),
+                    inputs=tuple(inputs.get(name, [])),
+                    outputs=tuple(outputs.get(name, [])),
+                )
+            )
+        return records
 
     def instances(self, *, include_orphaned: bool = True) -> list[InstanceRecord]:
         connection = self._database.connection()
