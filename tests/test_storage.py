@@ -1,8 +1,55 @@
 import datetime
+from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
 from noti_mapper.clock import from_iso, to_iso
+from noti_mapper.storage import (
+    SCHEMA_VERSION,
+    Database,
+    StorageError,
+    database_path,
+    initialize,
+)
+
+MOMENT = datetime.datetime(2026, 3, 1, 12, 0, tzinfo=datetime.UTC)
+
+
+@pytest.fixture
+def database(tmp_path: Path) -> Iterator[Database]:
+    opened = Database(path=database_path(tmp_path))
+    try:
+        yield opened
+    finally:
+        opened.close()
+
+
+# -- schema -------------------------------------------------------------------
+
+
+def test_initialize_creates_the_schema_and_is_idempotent(database: Database) -> None:
+    initialize(database)
+    initialize(database)
+
+    row = database.connection().execute("SELECT version FROM schema_version").fetchone()
+    assert int(row["version"]) == SCHEMA_VERSION
+    assert database.path.exists()
+
+
+def test_wal_mode_and_foreign_keys_are_on(database: Database) -> None:
+    initialize(database)
+    connection = database.connection()
+    assert str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"
+    assert int(connection.execute("PRAGMA foreign_keys").fetchone()[0]) == 1
+
+
+def test_an_unknown_schema_version_is_refused(database: Database) -> None:
+    initialize(database)
+    database.connection().execute("UPDATE schema_version SET version = 99")
+    with pytest.raises(StorageError, match="schema version 99"):
+        initialize(database)
+
 
 # -- timestamps ---------------------------------------------------------------
 
