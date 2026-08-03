@@ -145,6 +145,124 @@ class PagerDutyOutput(OutputPlugin):
     def dedup_key(self) -> str:
         return self._dedup_key
 
+    # -- lifecycle ------------------------------------------------------------
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._poll_loop, name=f"pagerduty-poll-{self.context.instance_name}", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=REQUEST_TIMEOUT_SECONDS + 5.0)
+
+    def health(self) -> PluginHealth:
+        with self._state_lock:
+            return PluginHealth(status=self._status, detail=self._detail)
+
+    # -- the write direction --------------------------------------------------
+
+    def apply(self, update: OutputUpdate) -> None:
+        action = "trigger" if update.state else "resolve"
+        payload: dict[str, object] = {
+            "routing_key": self._routing_key,
+            "event_action": action,
+            "dedup_key": self._dedup_key,
+        }
+        if update.state:
+            payload["payload"] = self._event_payload(update)
+
+        self._log.info(
+            "%s PagerDuty incident %s",
+            action,
+            self._dedup_key,
+            extra={"instance": self.context.instance_name, "dedup_key": self._dedup_key},
+        )
+        self._post(self._events_url, payload)
+
+    def _event_payload(self, update: OutputUpdate) -> dict[str, object]:
+        details: dict[str, object] = {
+            "instance": self.context.instance_name,
+            "rules": ", ".join(update.rules),
+            "trigger_count": update.trigger_count,
+        }
+        if update.cause:
+            details["caused_by"] = update.cause
+        if update.detail:
+            details["event"] = update.detail
+        if update.since is not None:
+            details["latched_since"] = update.since.isoformat()
+
+        payload: dict[str, object] = {
+            "summary": f"{self._summary}: {update.summary()}"[:1024],
+            "severity": self._severity,
+            "source": self._source,
+            "custom_details": details,
+        }
+        if update.since is not None:
+            payload["timestamp"] = update.since.isoformat()
+        if self._component is not None:
+            payload["component"] = self._component
+        if self._group is not None:
+            payload["group"] = self._group
+        if self._class is not None:
+            payload["class"] = self._class
+        return payload
+
+    # -- the reverse direction ------------------------------------------------
+
+    def query(self) -> RemoteState:
+        """Ask the REST API whether the incident is still open.
+
+        This is the unlatch path's source of truth, and it is also what
+        reconciliation reads. A resolved incident reports CLEARED along with the
+        time PagerDuty resolved it, which is what lets an event that arrived
+        after the resolve win.
+        """
+        try:
+            incidents = self._fetch_incidents()
+        except PluginError as error:
+            self._set_health(HealthStatus.DEGRADED, str(error))
+            return RemoteState(belief=RemoteBelief.UNKNOWN)
+
+        self._set_health(HealthStatus.OK, f"polling every {self._poll_seconds}s")
+
+        if not incidents:
+            # No incident has ever existed for this dedup key, so there is
+            # nothing to report either way. Saying CLEARED here would clear a
+            # latch on the strength of never having alerted.
+            return RemoteState(belief=RemoteBelief.UNKNOWN)
+
+        resolved_at: datetime.datetime | None = None
+        for incident in incidents:
+            status = str(incident.get("status", ""))
+            if status in OPEN_STATUSES:
+                return RemoteState(belief=RemoteBelief.ACTIVE)
+            moment = _parse_time(incident.get("resolved_at")) or _parse_time(
+                incident.get("last_status_change_at")
+            )
+            if moment is not None and (resolved_at is None or moment > resolved_at):
+                resolved_at = moment
+
+        return RemoteState(belief=RemoteBelief.CLEARED, cleared_at=resolved_at)
+
+    def _fetch_incidents(self) -> list[dict[str, object]]:
+        query = urlencode(
+            [("incident_key", self._dedup_key), ("limit", "10"), ("sort_by", "created_at:desc")]
+        )
+        url = f"{self._api_url}/incidents?{query}"
+        body = self._get(url)
+        incidents = body.get("incidents")
+        if not isinstance(incidents, list):
+            return []
+        result: list[dict[str, object]] = []
+        for item in incidents:
+            if isinstance(item, dict):
+                result.append({str(key): value for key, value in item.items()})
+        return result
+
     # -- HTTP -----------------------------------------------------------------
 
     def _post(self, url: str, payload: Mapping[str, object]) -> dict[str, object]:
@@ -200,3 +318,18 @@ def _optional_str(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _parse_time(value: Any) -> datetime.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=datetime.UTC)
+    return parsed.astimezone(datetime.UTC)
+
+
+OUTPUT_PLUGIN = PagerDutyOutput
