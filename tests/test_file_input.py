@@ -7,7 +7,7 @@ import pytest
 from file_input import FileInput
 from noti_mapper.clock import ManualClock
 from noti_mapper.plugin import ObservedEvent
-from noti_mapper.storage import Database, database_path, initialize
+from noti_mapper.storage import Database, HealthStatus, database_path, initialize
 from tests.support import make_context
 
 START = datetime.datetime(2026, 3, 1, 12, 0, tzinfo=datetime.UTC)
@@ -189,6 +189,62 @@ def test_without_a_glob_a_single_file_is_watched(watched: Path, database: Databa
     for _ in range(3):
         harness.poll()
     assert harness.paths() == [str(target)]
+
+
+def test_a_missing_directory_is_not_an_error(tmp_path: Path, database: Database) -> None:
+    harness = _harness(tmp_path / "absent", database, glob="*.txt")
+    for _ in range(3):
+        harness.poll()
+    assert harness.events == []
+    assert harness.plugin.health().status is HealthStatus.STARTING
+
+
+# -- catch-up -----------------------------------------------------------------
+
+
+def test_catch_up_uses_the_files_mtime_not_the_clock(watched: Path, database: Database) -> None:
+    harness = _harness(watched, database, glob="*.txt")
+    target = watched / "package.txt"
+    target.write_text("arrived while we were down", encoding="utf-8")
+
+    when = START - datetime.timedelta(hours=4)
+    import os
+
+    os.utime(target, (when.timestamp(), when.timestamp()))
+
+    events = harness.plugin.catch_up(START - datetime.timedelta(days=1))
+    assert len(events) == 1
+    assert events[0].occurred_at == when
+    assert events[0].metadata["cause"] == "catch-up"
+
+
+def test_catch_up_does_not_re_report_what_was_already_seen(
+    watched: Path, database: Database
+) -> None:
+    harness = _harness(watched, database, glob="*.txt")
+    (watched / "package.txt").write_text("one", encoding="utf-8")
+    for _ in range(3):
+        harness.poll()
+    assert len(harness.events) == 1
+
+    assert harness.plugin.catch_up(None) == []
+
+
+def test_catch_up_ignores_files_older_than_the_last_run(watched: Path, database: Database) -> None:
+    harness = _harness(watched, database, glob="*.txt")
+    target = watched / "ancient.txt"
+    target.write_text("from before", encoding="utf-8")
+
+    import os
+
+    long_ago = START - datetime.timedelta(days=30)
+    os.utime(target, (long_ago.timestamp(), long_ago.timestamp()))
+
+    assert harness.plugin.catch_up(START - datetime.timedelta(hours=1)) == []
+    # ...and it is remembered, so the watch loop does not fire for it either.
+    for _ in range(3):
+        harness.poll()
+    assert harness.events == []
 
 
 # -- settings -----------------------------------------------------------------
