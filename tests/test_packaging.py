@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from noti_mapper import VERSION
 from noti_mapper.cli import EXIT_OK, SUBCOMMANDS, build_parser, main, subcommand_names
 from noti_mapper.discovery import source_checkout_plugin_directory
 
@@ -166,6 +167,38 @@ def test_the_sysusers_home_matches_the_state_directory() -> None:
     entry = re.search(r"^u\s+\S+\s+\S+\s+\"[^\"]*\"\s+(\S+)", SYSUSERS.read_text(), re.MULTILINE)
     assert entry is not None
     assert entry.group(1) == "/var/lib/noti-mapper"
+
+
+# -- man pages ----------------------------------------------------------------
+
+
+def test_every_subcommand_is_documented() -> None:
+    page = (DIST / "man" / "noti-mapper.1").read_text(encoding="utf-8")
+    for command in SUBCOMMANDS:
+        assert re.search(
+            rf"^\.B(I)? {command}\b", page, re.MULTILINE
+        ), f"'{command}' is not documented in noti-mapper(1)"
+
+
+def test_the_config_page_documents_every_top_level_key() -> None:
+    page = (DIST / "man" / "noti-mapper.d.5").read_text(encoding="utf-8")
+    for key in ("instances", "rules", "daemon"):
+        assert key in page
+
+
+def test_the_rename_warning_is_prominent_in_the_config_page() -> None:
+    """The latch is keyed on the rule name; renaming silently drops it."""
+    page = (DIST / "man" / "noti-mapper.d.5").read_text(encoding="utf-8")
+    rules_index = page.index(".SH RULES")
+    warning_index = page.index("Renaming a rule is not free")
+    daemon_index = page.index(".SH DAEMON")
+    assert rules_index < warning_index < daemon_index
+
+
+def test_the_man_pages_carry_the_current_version() -> None:
+    for name in ("noti-mapper.1", "noti-mapper.d.5"):
+        page = (DIST / "man" / name).read_text(encoding="utf-8")
+        assert f"noti-mapper {VERSION}" in page
 
 
 def test_the_example_secrets_file_is_not_shipped_world_readable_by_accident() -> None:

@@ -1,0 +1,154 @@
+.TH NOTI\-MAPPER 1 "2026" "noti-mapper 0.1.0" "User Commands"
+.SH NAME
+noti\-mapper \- latch notification events onto outputs until acknowledged
+.SH SYNOPSIS
+.B noti\-mapper
+[\fIGLOBAL OPTIONS\fR]
+.I COMMAND
+[\fIARGUMENTS\fR]
+.SH DESCRIPTION
+.B noti\-mapper
+watches inputs, latches the events they report into persistent state, and
+drives outputs from that state until something explicitly clears it.
+.PP
+An input fires an
+.IR event :
+a matching mail arrives, a webhook is POSTed, a file appears. Every
+.I rule
+listing that input has its
+.I latch
+set. Every output listed by a set rule is driven true. The latch stays set
+until an
+.I unlatch
+arrives \- you turn the HomeKit switch off, or you resolve the PagerDuty
+incident \- at which point every rule that output renders is cleared together.
+.PP
+Inputs and outputs are booleans. Rules are straight routing with no conditions,
+schedules, or expressions. The core owns all latch state; plugins do only I/O.
+.SH COMMANDS
+.TP
+.B run
+Run the daemon. This is what the systemd unit invokes. Readiness is signalled
+after configuration validation and initial reconciliation, never before.
+.TP
+.B validate
+Load and check the configuration, then exit. Every problem is reported with a
+file and a line in one pass. Exits 0 when the configuration is usable and 2
+when it is not.
+.TP
+.B status
+Print current latches, orphaned rules, output synchronisation state, pending
+retries, plugin health, and the most recent events. The first thing to run when
+something has misbehaved.
+.TP
+.B rename \fIOLD\fR \fINEW\fR
+Migrate a rule's latch record to a new name. See
+.B RENAMING RULES
+below. Run this while the daemon is stopped.
+.TP
+.B purge [\fB\-y\fR]
+Delete orphaned latches and the stored state of instances that configuration no
+longer defines. Asks for confirmation unless
+.B \-y
+is given.
+.TP
+.B version
+Print the version and exit.
+.SH GLOBAL OPTIONS
+.TP
+.BI \-\-config\-dir " DIRECTORY"
+Read \fB*.json\fR configuration from \fIDIRECTORY\fR instead of
+\fI/etc/noti\-mapper.d\fR.
+.TP
+.BI \-\-secrets " PATH"
+Read secrets from \fIPATH\fR instead of \fI/etc/noti\-mapper/secrets.json\fR.
+.TP
+.BI \-\-state\-dir " DIRECTORY"
+Keep \fBstate.db\fR in \fIDIRECTORY\fR instead of \fI/var/lib/noti\-mapper\fR.
+Under systemd this is taken from \fB$STATE_DIRECTORY\fR.
+.TP
+.BI \-\-plugin\-dir " DIRECTORY"
+Replace the plugin search path. May be given more than once, in which case the
+directories are scanned in the order given.
+.TP
+.BI \-\-log\-level " LEVEL"
+One of \fBdebug\fR, \fBinfo\fR, \fBwarning\fR, \fBerror\fR, \fBcritical\fR.
+Defaults to \fBinfo\fR.
+.SH NAMES
+Every identifier is a name the user typed. There are no numeric IDs and no
+generated keys anywhere in the configuration surface or in this command.
+.PP
+Names may contain letters, digits, spaces, hyphens, underscores, and periods,
+up to 128 characters. Everything else is rejected, quotes and slashes in
+particular, because names flow into command arguments and log lines. Names are
+stored as typed but compared case\-insensitively, so \fBPorch Mail\fR and
+\fBporch mail\fR in one namespace is a configuration error rather than two
+objects. Instance names and rule names are separate namespaces; a rule may
+share a name with an instance.
+.PP
+Spaces are allowed because they read well. They need quoting here:
+.PP
+.RS
+.nf
+noti\-mapper rename "Package On Porch" "Porch Package"
+.fi
+.RE
+.SH RENAMING RULES
+The latch is keyed on the rule name, so renaming a rule in a configuration file
+is indistinguishable from deleting one rule and creating another: the old latch
+orphans and the new rule starts cleared. If that rule was set, the thing it was
+telling you about is silently forgotten.
+.PP
+.B noti\-mapper rename
+migrates the latch record instead. Stop the daemon, run it, then edit the
+configuration to match.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+The command failed.
+.TP
+.B 2
+The configuration is invalid.
+.SH FILES
+.TP
+.I /etc/noti-mapper.d/*.json
+Configuration, merged in lexical order. See
+.BR noti-mapper.d (5).
+.TP
+.I /etc/noti-mapper/secrets.json
+Secret values, mode 0600. The daemon refuses to start if this file is readable
+by group or other.
+.TP
+.I /var/lib/noti-mapper/state.db
+Latch state, retry queue, plugin scratch storage, and the rolling event log.
+.TP
+.I /usr/lib/noti-mapper/plugins/
+Packaged plugins.
+.TP
+.I /etc/noti-mapper/plugins/
+Locally\-authored plugins.
+.TP
+.I /usr/share/doc/noti-mapper/examples/
+Example configuration. Not live; copy what you want into place.
+.SH OBSERVABILITY
+There is no metrics endpoint. Logging is structured and goes to the journal:
+.PP
+.RS
+.nf
+journalctl \-u noti\-mapper \-\-since "3 weeks ago"
+.fi
+.RE
+.PP
+Every state transition logs the new value, the cause, the originating instance,
+the rule, the event metadata, and the outcome of each output push. The rolling
+event log in the database exists for the same question and can be read with
+.BR "noti-mapper status" .
+It is a log and not an audit trail: it rolls by size, and no part of the daemon
+reads it back to make a decision.
+.SH SEE ALSO
+.BR noti-mapper.d (5),
+.BR systemd.service (5),
+.BR journalctl (1)

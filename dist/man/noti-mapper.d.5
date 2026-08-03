@@ -1,0 +1,179 @@
+.TH NOTI\-MAPPER.D 5 "2026" "noti-mapper 0.1.0" "File Formats"
+.SH NAME
+noti\-mapper.d \- configuration files for noti\-mapper
+.SH SYNOPSIS
+.nf
+/etc/noti\-mapper.d/*.json
+/etc/noti\-mapper/secrets.json
+.fi
+.SH DESCRIPTION
+Configuration is a set of JSON files in \fI/etc/noti\-mapper.d/\fR, read in
+lexical order and merged. A later file may add instances and rules; redefining
+a name an earlier file already defined is an error, not an override. Silent
+shadowing across drop\-in files is miserable to debug and there is no use case
+for it here.
+.PP
+Every file is a JSON object with one or more of the top\-level keys
+.BR instances ,
+.BR rules ,
+and
+.BR daemon .
+A single file may carry all of them.
+.PP
+Run
+.B noti\-mapper validate
+after editing. Every problem is reported with a file and a line, all in one
+pass.
+.SH INSTANCES
+An
+.I instance
+is a configured, named occurrence of a plugin. Two IMAP readers watching
+different mailboxes are two instances of one plugin.
+.PP
+.RS
+.nf
+{
+  "instances": {
+    "Porch Mail": {
+      "plugin": "imap-input",
+      "config": {
+        "host": "mail.example.net",
+        "username": "user@example.net",
+        "password": "${secret:porch_mail_password}",
+        "folder": "Packages",
+        "senders": ["amazon.com", "ups.com"],
+        "subject_patterns": ["^Delivered:"],
+        "dry_run": false
+      }
+    },
+    "Porch Lamp": {
+      "plugin": "homekit-output",
+      "config": { "display_name": "Package Waiting" }
+    }
+  }
+}
+.fi
+.RE
+.TP
+.B plugin
+Required. The plugin's own identifier, not a name you choose. An unknown value
+is a fatal error whose message lists the plugins that did load.
+.TP
+.B config
+Optional. A plugin\-specific object. Each plugin validates its own, so
+unrecognised keys and missing required ones are reported by
+.BR "noti-mapper validate" .
+.TP
+.B enabled
+Optional, default \fBtrue\fR. A disabled instance is not started and drops out
+of every rule that names it.
+.SH RULES
+A
+.I rule
+maps a set of input instances to a set of output instances. The latch belongs
+to the rule.
+.PP
+.RS
+.nf
+{
+  "rules": {
+    "Package On Porch": {
+      "inputs": ["Porch Mail"],
+      "outputs": ["Porch Lamp", "Porch Pager"]
+    }
+  }
+}
+.fi
+.RE
+.PP
+.B Renaming a rule is not free.
+The latch is keyed on the rule name, so changing that name here is
+indistinguishable from deleting one rule and creating another: the old latch
+orphans and the new rule starts cleared. Use
+.B noti\-mapper rename
+to migrate the latch first. See
+.BR noti-mapper (1).
+.TP
+.B inputs
+Required, non\-empty. An event from any listed instance sets the latch; inputs
+are OR'd.
+.TP
+.B outputs
+Required, non\-empty. Every listed instance is driven from the latch, and an
+unlatch from any of them clears it.
+.TP
+.B enabled
+Optional, default \fBtrue\fR.
+.SH SEMANTICS
+.SS Two outputs on one rule are coupled
+Clearing from either output clears the rule, so both go quiet together. A user
+who wants to clear the lamp without resolving the pager writes two rules with
+one output each. The coupling is a configuration decision rather than a
+hardcoded behaviour, which is the point of keying latches on the rule.
+.SS The same input in two rules latches twice
+Each rule gets its own latch. The input fires, both set, and clearing one
+leaves the other set.
+.SS An output is the OR of its rules
+An output listed by two rules is true while either latch is set, and clearing
+one rule does not drop it while the other is still set.
+.SS Re\-triggering is not a no\-op
+An event against an already\-set latch bumps a counter and moves the timestamp,
+so an output can render "3 packages waiting", but it produces no output
+transition.
+.SH DAEMON
+Optional, and at most one file may contain it.
+.PP
+.RS
+.nf
+{
+  "daemon": {
+    "event_log_max_rows": 10000,
+    "dispatcher_threads": 4,
+    "retry_initial_seconds": 5,
+    "retry_max_seconds": 900
+  }
+}
+.fi
+.RE
+.TP
+.B event_log_max_rows
+Rows kept in the rolling event log, oldest dropped first. Default 10000.
+.TP
+.B dispatcher_threads
+Threads performing outbound pushes. Default 4.
+.TP
+.B retry_initial_seconds
+Delay before the first retry of a failed push, doubling thereafter. Default 5.
+.TP
+.B retry_max_seconds
+Ceiling on the retry delay. Default 900.
+.SH SECRETS
+Secrets live in \fI/etc/noti\-mapper/secrets.json\fR, deliberately outside the
+\fB.d\fR glob so they are not swept up by configuration merging and can carry
+different permissions. The file is a flat object mapping names to strings:
+.PP
+.RS
+.nf
+{ "porch_mail_password": "hunter2" }
+.fi
+.RE
+.PP
+Reference a secret from any string inside an instance's
+.B config
+block as \fB${secret:name}\fR. Substitution works inside a larger string, so
+\fB"imaps://${secret:user}@host"\fR is fine.
+.PP
+The file must be mode 0600. The daemon refuses to start if it is readable by
+group or other, and says so with the offending mode. A referenced secret that
+does not exist is a configuration validation error, not a runtime failure.
+.PP
+The design goal is worth stating: configuration files never contain secret
+material, which means they stay safe to paste into a bug report.
+.SH VALIDATION
+The daemon refuses to start on an unknown plugin, a duplicate name
+(case\-insensitively), a rule referencing an instance that does not exist, a
+rule listing an output instance among its inputs or the reverse, a missing
+required plugin setting, a group\- or world\-readable secrets file, or malformed
+JSON. All errors are reported together.
+.SH SEE ALSO
+.BR noti-mapper (1)
