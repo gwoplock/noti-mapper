@@ -36,12 +36,14 @@ from noti_mapper.config import (
 from noti_mapper.discovery import default_search_path, discover, known_plugins
 from noti_mapper.logging_setup import configure as configure_logging
 from noti_mapper.logging_setup import level_from_name
+from noti_mapper.names import InvalidNameError, validate_name
 from noti_mapper.rules import RuleGraph
 from noti_mapper.runtime import Daemon, Paths, StartupError
 from noti_mapper.secrets import DEFAULT_SECRETS_PATH, SecretsError, empty_store, load_secrets
 from noti_mapper.storage import (
     DEFAULT_STATE_DIRECTORY,
     Database,
+    EventKind,
     StorageError,
     Store,
     database_path,
@@ -374,3 +376,41 @@ def _duration(seconds: float) -> str:
     if seconds < 86400:
         return f"{seconds / 3600:.1f}h"
     return f"{seconds / 86400:.1f}d"
+
+
+# -- rename -------------------------------------------------------------------
+
+
+def _rename(paths: Paths, *, old_name: str, new_name: str) -> int:
+    try:
+        old = validate_name(old_name)
+        new = validate_name(new_name)
+    except InvalidNameError as error:
+        print(f"noti-mapper: {error}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    path = database_path(paths.state_directory)
+    if not path.exists():
+        print(f"noti-mapper: no state database at {path}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    database = Database(path=path)
+    try:
+        initialize(database)
+        store = Store(database=database)
+        store.rename_rule(old_name=old, new_name=new)
+        store.append_event(
+            at=SystemClock().now(),
+            kind=EventKind.RENAMED,
+            rule_name=new,
+            detail=f"renamed from {old!r}",
+        )
+    except StorageError as error:
+        print(f"noti-mapper: {error}", file=sys.stderr)
+        return EXIT_FAILURE
+    finally:
+        database.close()
+
+    print(f"renamed rule {old!r} to {new!r}; its latch moved with it.")
+    print("Update the configuration to match before starting the daemon.")
+    return EXIT_OK

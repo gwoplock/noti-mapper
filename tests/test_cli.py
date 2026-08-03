@@ -268,3 +268,50 @@ def test_status_still_works_when_the_configuration_is_broken(
     output = capsys.readouterr().out
     assert "does not currently load" in output
     assert "'Package On Porch'" in output
+
+
+# -- rename -------------------------------------------------------------------
+
+
+def test_rename_migrates_the_latch(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _valid_config(workspace)
+    _seed_state(workspace)
+
+    assert main(_argv(workspace, "rename", "Package On Porch", "Porch Package")) == EXIT_OK
+    assert "its latch moved with it" in capsys.readouterr().out
+
+    database = Database(path=database_path(workspace["state"]))
+    try:
+        store = Store(database=database)
+        assert store.latch("Package On Porch") is None
+        moved = store.latch("Porch Package")
+        assert moved is not None
+        assert moved.state is True
+        assert moved.trigger_count == 3
+    finally:
+        database.close()
+
+
+def test_rename_rejects_an_invalid_new_name(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_state(workspace)
+    assert main(_argv(workspace, "rename", "Package On Porch", "Porch/Package")) == EXIT_FAILURE
+    assert "disallowed characters" in capsys.readouterr().err
+
+
+def test_rename_rejects_an_unknown_rule(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_state(workspace)
+    assert main(_argv(workspace, "rename", "Nope", "Also Nope")) == EXIT_FAILURE
+    assert "no rule named" in capsys.readouterr().err
+
+
+def test_rename_without_a_database(
+    workspace: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(_argv(workspace, "rename", "A", "B")) == EXIT_FAILURE
+    assert "no state database" in capsys.readouterr().err
