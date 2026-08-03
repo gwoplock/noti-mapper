@@ -1,10 +1,11 @@
+import os
 import socket
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from noti_mapper.sdnotify import Notifier
+from noti_mapper.sdnotify import Notifier, watchdog_interval_seconds
 
 
 @pytest.fixture
@@ -72,3 +73,38 @@ def test_the_socket_comes_from_the_environment(
     monkeypatch.setenv("NOTIFY_SOCKET", address)
     Notifier().ready()
     assert _received(server) == "READY=1"
+
+
+# -- watchdog interval --------------------------------------------------------
+
+
+def test_the_watchdog_interval_is_half_the_configured_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WATCHDOG_USEC", "30000000")
+    monkeypatch.delenv("WATCHDOG_PID", raising=False)
+    assert watchdog_interval_seconds() == 15.0
+
+
+def test_no_watchdog_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WATCHDOG_USEC", raising=False)
+    assert watchdog_interval_seconds() is None
+
+
+@pytest.mark.parametrize("value", ["", "0", "-1", "not a number"])
+def test_a_nonsense_watchdog_interval_is_ignored(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("WATCHDOG_USEC", value)
+    assert watchdog_interval_seconds() is None
+
+
+def test_the_watchdog_is_ignored_when_it_is_meant_for_another_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WATCHDOG_USEC", "30000000")
+    monkeypatch.setenv("WATCHDOG_PID", str(os.getpid() + 1))
+    assert watchdog_interval_seconds() is None
+
+    monkeypatch.setenv("WATCHDOG_PID", str(os.getpid()))
+    assert watchdog_interval_seconds() == 15.0
