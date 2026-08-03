@@ -15,7 +15,9 @@ Two things make that work in practice:
   stderr an error.
 """
 
+import enum
 import logging
+import os
 
 # Attributes every LogRecord has. Anything else on a record came from an
 # `extra=` argument and is worth printing.
@@ -46,6 +48,34 @@ _STANDARD_RECORD_ATTRIBUTES: frozenset[str] = frozenset(
         "threadName",
     }
 )
+
+
+class SyslogPriority(enum.Enum):
+    """The subset of syslog priorities the daemon emits."""
+
+    ERROR = 3
+    WARNING = 4
+    NOTICE = 5
+    INFO = 6
+    DEBUG = 7
+
+
+def priority_for(level: int) -> SyslogPriority:
+    if level >= logging.ERROR:
+        return SyslogPriority.ERROR
+    if level >= logging.WARNING:
+        return SyslogPriority.WARNING
+    if level >= logging.INFO:
+        return SyslogPriority.INFO
+    return SyslogPriority.DEBUG
+
+
+def running_under_journal() -> bool:
+    """True when systemd connected our stderr to the journal.
+
+    systemd sets ``JOURNAL_STREAM`` for exactly this purpose.
+    """
+    return "JOURNAL_STREAM" in os.environ
 
 
 class StructuredFormatter(logging.Formatter):
