@@ -7,10 +7,15 @@ rule true by construction rather than by discipline.
 """
 
 import datetime
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from noti_mapper.config import Configuration
 from noti_mapper.plugin import ObservedEvent
+
+if TYPE_CHECKING:
+    from noti_mapper.engine import PluginSet
 
 
 @dataclass(frozen=True)
@@ -66,9 +71,18 @@ class CatchUpMessage:
 
 @dataclass(frozen=True)
 class ReloadMessage:
-    """Configuration has been re-read and validated; adopt it."""
+    """Configuration has been re-read and validated; adopt it.
+
+    ``plugins`` carries instances the reload thread has constructed but not
+    started. The core thread adopts them, then sets ``acknowledged`` so the
+    reload thread knows it is safe to start the new plugins and stop the old
+    ones -- the swap itself happens on the core thread, like every other
+    state change.
+    """
 
     configuration: Configuration
+    plugins: "PluginSet | None" = None
+    acknowledged: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass(frozen=True)
