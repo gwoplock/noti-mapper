@@ -1,8 +1,16 @@
 import datetime
+import logging
+import sys
+from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
+
+from noti_mapper.config import PluginDirection
 from noti_mapper.discovery import (
+    DiscoveryResult,
     default_search_path,
+    discover,
     source_checkout_plugin_directory,
 )
 from noti_mapper.plugin import (
@@ -13,6 +21,180 @@ from noti_mapper.plugin import (
     clamp_metadata,
 )
 from noti_mapper.storage import HealthStatus
+
+_INPUT_SOURCE = """
+import datetime
+from collections.abc import Mapping
+
+from noti_mapper.plugin import InputPlugin, ObservedEvent, PluginHealth
+from noti_mapper.storage import HealthStatus
+
+PLUGIN_NAME = "{plugin_name}"
+
+
+class Reader(InputPlugin):
+    @classmethod
+    def validate_settings(cls, settings: Mapping[str, object]) -> list[str]:
+        if "host" in settings:
+            return []
+        return ['"host" is required']
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def health(self) -> PluginHealth:
+        return PluginHealth(status=HealthStatus.OK)
+
+    def catch_up(self, since: datetime.datetime | None) -> list[ObservedEvent]:
+        return []
+
+
+INPUT_PLUGIN = Reader
+"""
+
+_OUTPUT_SOURCE = """
+from collections.abc import Mapping
+
+from noti_mapper.plugin import OutputPlugin, PluginHealth, RemoteBelief, RemoteState
+from noti_mapper.storage import HealthStatus
+
+PLUGIN_NAME = "{plugin_name}"
+
+
+class Switch(OutputPlugin):
+    @classmethod
+    def validate_settings(cls, settings: Mapping[str, object]) -> list[str]:
+        return []
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def apply(self, state: bool) -> None:
+        pass
+
+    def query(self) -> RemoteState:
+        return RemoteState(belief=RemoteBelief.UNKNOWN)
+
+    def health(self) -> PluginHealth:
+        return PluginHealth(status=HealthStatus.OK)
+
+
+OUTPUT_PLUGIN = Switch
+"""
+
+
+@pytest.fixture(autouse=True)
+def clean_module_table() -> Iterator[None]:
+    """Plugins land in sys.modules; do not let one test leak into the next."""
+    before = set(sys.modules)
+    yield
+    for name in set(sys.modules) - before:
+        if name.startswith("noti_mapper_plugin_"):
+            del sys.modules[name]
+
+
+def _write_plugin(directory: Path, name: str, source: str) -> Path:
+    plugin_directory = directory / name
+    plugin_directory.mkdir(parents=True, exist_ok=True)
+    (plugin_directory / "__init__.py").write_text(source, encoding="utf-8")
+    return plugin_directory
+
+
+def _scan(*directories: Path) -> DiscoveryResult:
+    return discover(search_path=list(directories), logger=logging.getLogger("test.discovery"))
+
+
+# -- happy path ---------------------------------------------------------------
+
+
+def test_a_directory_with_an_input_class_is_found(tmp_path: Path) -> None:
+    _write_plugin(tmp_path, "reader", _INPUT_SOURCE.format(plugin_name="test-input"))
+    result = _scan(tmp_path)
+
+    assert result.failures == ()
+    assert result.names() == ["test-input"]
+    plugin = result.plugins["test-input"]
+    assert plugin.input_class is not None
+    assert plugin.output_class is None
+    assert plugin.directions() == frozenset({PluginDirection.INPUT})
+
+
+def test_input_and_output_plugins_are_distinguished(tmp_path: Path) -> None:
+    _write_plugin(tmp_path, "reader", _INPUT_SOURCE.format(plugin_name="test-input"))
+    _write_plugin(tmp_path, "switch", _OUTPUT_SOURCE.format(plugin_name="test-output"))
+    result = _scan(tmp_path)
+
+    assert result.names() == ["test-input", "test-output"]
+    assert result.plugins["test-output"].directions() == frozenset({PluginDirection.OUTPUT})
+
+
+def test_a_missing_search_directory_is_not_an_error(tmp_path: Path) -> None:
+    result = _scan(tmp_path / "absent")
+    assert result.plugins == {}
+    assert result.failures == ()
+
+
+def test_directories_are_scanned_in_order_and_the_first_wins(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_plugin(first, "reader_a", _INPUT_SOURCE.format(plugin_name="shared"))
+    _write_plugin(second, "reader_b", _INPUT_SOURCE.format(plugin_name="shared"))
+
+    result = _scan(first, second)
+    assert result.names() == ["shared"]
+    assert result.plugins["shared"].directory == first / "reader_a"
+    assert len(result.failures) == 1
+    assert "already provided by" in result.failures[0].message
+
+
+def test_non_plugin_directories_are_ignored(tmp_path: Path) -> None:
+    (tmp_path / "not-a-package").mkdir()
+    (tmp_path / "not-a-package" / "readme.txt").write_text("hi", encoding="utf-8")
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / ".hidden" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "loose.py").write_text("PLUGIN_NAME = 'nope'", encoding="utf-8")
+
+    result = _scan(tmp_path)
+    assert result.plugins == {}
+    assert result.failures == ()
+
+
+# -- multi-file plugins -------------------------------------------------------
+
+
+def test_a_plugin_may_import_its_own_submodules(tmp_path: Path) -> None:
+    directory = _write_plugin(
+        tmp_path,
+        "multi",
+        "from noti_mapper_plugin_multi.helper import NAME\n"
+        "from noti_mapper.plugin import InputPlugin\n"
+        "import datetime\n"
+        "from noti_mapper.plugin import ObservedEvent, PluginHealth\n"
+        "from noti_mapper.storage import HealthStatus\n\n"
+        "PLUGIN_NAME = NAME\n\n\n"
+        "class Reader(InputPlugin):\n"
+        "    def start(self) -> None:\n        pass\n"
+        "    def stop(self) -> None:\n        pass\n"
+        "    def health(self) -> PluginHealth:\n"
+        "        return PluginHealth(status=HealthStatus.OK)\n"
+        "    def catch_up(self, since: datetime.datetime | None) -> list[ObservedEvent]:\n"
+        "        return []\n\n\n"
+        "INPUT_PLUGIN = Reader\n",
+    )
+    (directory / "helper.py").write_text("NAME = 'multi-file'\n", encoding="utf-8")
+
+    result = _scan(tmp_path)
+    assert result.failures == ()
+    assert result.names() == ["multi-file"]
+
 
 # -- the default search path --------------------------------------------------
 
