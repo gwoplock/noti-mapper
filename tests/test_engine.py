@@ -31,6 +31,7 @@ from noti_mapper.storage import (
 from tests.support import (
     FakeInput,
     FakeOutput,
+    FakeOutputBehaviour,
     InlineDispatcher,
     make_context,
 )
@@ -184,6 +185,168 @@ def _build(
 @pytest.fixture
 def simple(tmp_path: Path) -> Iterator[Harness]:
     yield from _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])})
+
+
+# -- the basic loop -----------------------------------------------------------
+
+
+def test_an_event_latches_the_rule_and_drives_the_output(simple: Harness) -> None:
+    assert simple.latch("R") is False
+
+    simple.fire("Mail", metadata={"subject": "Delivered: box"})
+
+    assert simple.latch("R") is True
+    assert simple.applied("Lamp") == [True]
+
+    record = simple.store.latch("R")
+    assert record is not None
+    assert record.trigger_count == 1
+    assert record.last_cause == "Mail"
+    assert record.set_at == START
+
+
+def test_the_event_log_records_the_transition_and_its_cause(simple: Harness) -> None:
+    simple.fire("Mail", metadata={"sender": "ups.com"})
+    kinds = simple.event_kinds()
+    assert EventKind.INPUT_EVENT in kinds
+    assert EventKind.LATCH_SET in kinds
+    assert EventKind.OUTPUT_PUSH_SUCCEEDED in kinds
+
+    latch_entry = next(
+        entry for entry in simple.store.recent_events(200) if entry.kind is EventKind.LATCH_SET
+    )
+    assert latch_entry.rule_name == "R"
+    assert latch_entry.instance_name == "Mail"
+    assert "ups.com" in latch_entry.detail
+
+
+def test_an_event_matching_no_rule_is_logged_and_dropped(simple: Harness) -> None:
+    simple.engine.submit(
+        InputEventMessage(
+            instance_name="Unwired", event=ObservedEvent(occurred_at=simple.clock.now())
+        )
+    )
+    simple.engine.drain()
+    assert simple.latch("R") is False
+    assert EventKind.INPUT_EVENT in simple.event_kinds()
+
+
+# -- re-triggering ------------------------------------------------------------
+
+
+def test_retriggering_bumps_the_counter_without_a_second_transition(simple: Harness) -> None:
+    simple.fire("Mail")
+    simple.clock.advance(30)
+    simple.fire("Mail")
+    simple.clock.advance(30)
+    simple.fire("Mail")
+
+    record = simple.store.latch("R")
+    assert record is not None
+    assert record.state is True
+    assert record.trigger_count == 3
+    assert record.set_at == START + datetime.timedelta(seconds=60)
+
+    assert simple.applied("Lamp") == [True]
+    assert simple.event_kinds().count(EventKind.LATCH_SET) == 1
+    assert simple.event_kinds().count(EventKind.LATCH_RETRIGGERED) == 2
+
+
+# -- rule semantics -----------------------------------------------------------
+
+
+def test_multiple_inputs_are_ord(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail", "Hook"], ["Lamp"])}):
+        harness.fire("Hook")
+        assert harness.latch("R") is True
+        assert harness.applied("Lamp") == [True]
+
+        harness.fire("Mail")
+        assert harness.applied("Lamp") == [True]
+
+
+# -- pushes cannot veto state -------------------------------------------------
+
+
+def test_a_failing_push_does_not_prevent_the_latch(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp", "Pager"])}):
+        harness.outputs["Pager"].configure(FakeOutputBehaviour(apply_always_fails=True))
+
+        harness.fire("Mail")
+
+        assert harness.latch("R") is True
+        assert harness.applied("Lamp") == [True]
+        assert harness.applied("Pager") == []
+
+        pending = harness.store.pending_push("Pager")
+        assert pending is not None
+        assert pending.target_value is True
+        assert pending.attempt_count == 1
+        assert pending.last_error is not None
+        assert EventKind.OUTPUT_PUSH_FAILED in harness.event_kinds()
+
+
+def test_a_failed_push_retries_with_exponential_backoff(tmp_path: Path) -> None:
+    settings = DaemonSettings(retry_initial_seconds=5.0, retry_max_seconds=20.0)
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}, settings=settings):
+        harness.outputs["Lamp"].configure(FakeOutputBehaviour(apply_always_fails=True))
+        harness.fire("Mail")
+
+        delays: list[float] = []
+        for _ in range(5):
+            pending = harness.store.pending_push("Lamp")
+            assert pending is not None
+            delays.append((pending.next_attempt_at - harness.clock.now()).total_seconds())
+            harness.clock.advance(delays[-1])
+            harness.engine.drain()
+
+        assert delays == [5.0, 10.0, 20.0, 20.0, 20.0]
+
+
+def test_a_retry_eventually_succeeds_and_clears_the_pending_row(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        harness.outputs["Lamp"].configure(FakeOutputBehaviour(apply_failures=2))
+        harness.fire("Mail")
+
+        for _ in range(3):
+            harness.clock.advance(3600)
+            harness.engine.drain()
+
+        assert harness.applied("Lamp") == [True]
+        assert harness.store.pending_push("Lamp") is None
+
+        state = harness.store.output_state("Lamp")
+        assert state is not None
+        assert state.last_applied is True
+
+
+def test_a_pending_push_survives_a_restart(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        harness.outputs["Lamp"].configure(FakeOutputBehaviour(apply_always_fails=True))
+        harness.fire("Mail")
+        assert harness.store.pending_push("Lamp") is not None
+
+    for restarted in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        assert restarted.latch("R") is True
+        pending = restarted.store.pending_push("Lamp")
+        assert pending is not None
+        assert pending.target_value is True
+
+        restarted.clock.advance(3600)
+        restarted.engine.drain()
+        assert restarted.applied("Lamp") == [True]
+
+
+def test_a_push_to_a_vanished_instance_is_dropped(simple: Harness) -> None:
+    simple.outputs["Lamp"].configure(FakeOutputBehaviour(apply_always_fails=True))
+    simple.fire("Mail")
+    assert simple.store.pending_push("Lamp") is not None
+
+    del simple.engine._plugins.outputs["Lamp"]  # noqa: SLF001 - simulating a reload
+    simple.clock.advance(3600)
+    simple.engine.drain()
+
+    assert simple.store.pending_push("Lamp") is None
 
 
 # -- health -------------------------------------------------------------------

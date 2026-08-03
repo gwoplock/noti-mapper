@@ -292,6 +292,102 @@ class Engine:
         else:
             self._stopping = True
 
+    # -- input events ---------------------------------------------------------
+
+    def _handle_input_event(self, message: InputEventMessage) -> None:
+        now = self._clock.now()
+        rules = self._graph.rules_for_input(message.instance_name)
+        event = message.event
+
+        with self._store.database.transaction():
+            self._append_event(
+                at=now,
+                kind=EventKind.INPUT_EVENT,
+                instance_name=message.instance_name,
+                detail=event.summary(),
+            )
+
+            if not rules:
+                self._log.warning(
+                    "event from %s matches no rule; nothing to latch",
+                    message.instance_name,
+                    extra={"instance": message.instance_name},
+                )
+                return
+
+            for rule in rules:
+                self._apply_trigger(
+                    rule_name=rule.name,
+                    at=event.occurred_at,
+                    cause=message.instance_name,
+                    summary=event.summary(),
+                    now=now,
+                )
+
+            affected = self._graph.outputs_affected_by([rule.name for rule in rules])
+            self._sync_outputs(affected, now=now)
+
+    def _apply_trigger(
+        self,
+        *,
+        rule_name: str,
+        at: datetime.datetime,
+        cause: str,
+        summary: str,
+        now: datetime.datetime,
+    ) -> None:
+        record = self._latch(rule_name)
+
+        if record.state:
+            # Re-triggering an already-set latch is not a no-op at the record
+            # level -- the counter and timestamp move, so an output can render
+            # "3 packages waiting" -- but it produces no output transition.
+            updated = replace(
+                record,
+                set_at=at,
+                trigger_count=record.trigger_count + 1,
+                last_cause=cause,
+            )
+            self._write_latch(updated)
+            self._append_event(
+                at=now,
+                kind=EventKind.LATCH_RETRIGGERED,
+                rule_name=rule_name,
+                instance_name=cause,
+                detail=f"count={updated.trigger_count} {summary}",
+            )
+            self._log.info(
+                "rule %r re-triggered by %r (count %d); no output transition",
+                rule_name,
+                cause,
+                updated.trigger_count,
+                extra={"rule": rule_name, "instance": cause, "count": updated.trigger_count},
+            )
+            return
+
+        updated = replace(
+            record,
+            state=True,
+            set_at=at,
+            trigger_count=record.trigger_count + 1,
+            last_cause=cause,
+        )
+        self._write_latch(updated)
+        self._append_event(
+            at=now,
+            kind=EventKind.LATCH_SET,
+            rule_name=rule_name,
+            instance_name=cause,
+            detail=summary,
+        )
+        self._log.info(
+            "rule %r latched by %r: %s",
+            rule_name,
+            cause,
+            summary,
+            extra={"rule": rule_name, "instance": cause, "state": True},
+        )
+
     # -- push results ---------------------------------------------------------
 
     def _handle_push_result(self, message: PushResultMessage) -> None:
