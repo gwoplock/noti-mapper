@@ -39,3 +39,40 @@ def test_unknown_instances_index_to_nothing() -> None:
     assert graph.rules_for_input("Nope") == []
     assert graph.rules_for_output("Nope") == []
     assert graph.rule("Nope") is None
+
+
+# -- output state is the OR of its rules' latches ------------------------------
+
+
+def test_an_output_is_true_when_any_of_its_rules_is_latched() -> None:
+    graph = _graph(
+        Rule(name="A", inputs=("Mail",), outputs=("Shared",)),
+        Rule(name="B", inputs=("Hook",), outputs=("Shared",)),
+    )
+
+    assert graph.desired_output_state(instance_name="Shared", latches={}) is False
+    assert (
+        graph.desired_output_state(instance_name="Shared", latches={"A": True, "B": False}) is True
+    )
+    assert (
+        graph.desired_output_state(instance_name="Shared", latches={"A": False, "B": True}) is True
+    )
+    assert (
+        graph.desired_output_state(instance_name="Shared", latches={"A": False, "B": False})
+        is False
+    )
+
+
+def test_an_output_no_rule_names_is_false() -> None:
+    graph = _graph(Rule(name="A", inputs=("Mail",), outputs=("Lamp",)))
+    assert graph.desired_output_state(instance_name="Other", latches={"A": True}) is False
+
+
+def test_outputs_affected_by_collects_across_rules() -> None:
+    graph = _graph(
+        Rule(name="A", inputs=("Mail",), outputs=("Lamp", "Pager")),
+        Rule(name="B", inputs=("Hook",), outputs=("Lamp",)),
+    )
+    assert graph.outputs_affected_by(["A", "B"]) == ["Lamp", "Pager"]
+    assert graph.outputs_affected_by(["B"]) == ["Lamp"]
+    assert graph.outputs_affected_by(["Gone"]) == []
