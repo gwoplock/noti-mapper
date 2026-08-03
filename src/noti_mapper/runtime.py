@@ -298,6 +298,7 @@ class Daemon:
                 storage=PluginKeyValueStore(database=database, instance_name=configured.name),
                 clock=self._clock,
                 logger=self._log.getChild(f"plugin.{configured.name}"),
+                state_directory=self._paths.state_directory,
             )
             live = _LiveInstance(
                 name=configured.name,

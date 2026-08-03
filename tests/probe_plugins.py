@@ -77,6 +77,7 @@ from pathlib import Path
 
 from noti_mapper.plugin import (
     OutputPlugin,
+    OutputUpdate,
     PluginError,
     PluginHealth,
     RemoteBelief,
@@ -129,10 +130,12 @@ class ProbeOutput(OutputPlugin):
         if self._thread is not None:
             self._thread.join(timeout=2.0)
 
-    def apply(self, state: bool) -> None:
+    def apply(self, update: OutputUpdate) -> None:
         if self._fail_file is not None and self._fail_file.exists():
             raise PluginError("probe-output was told to fail")
-        self._state_file.write_text("true" if state else "false", encoding="utf-8")
+        self._state_file.write_text("true" if update.state else "false", encoding="utf-8")
+        detail = Path(str(self._state_file) + ".detail")
+        detail.write_text(update.summary(), encoding="utf-8")
 
     def query(self) -> RemoteState:
         if self._belief_file is None or not self._belief_file.exists():

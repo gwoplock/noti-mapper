@@ -75,7 +75,8 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         set_at          TEXT,
         cleared_at      TEXT,
         trigger_count   INTEGER NOT NULL DEFAULT 0,
-        last_cause      TEXT
+        last_cause      TEXT,
+        last_detail     TEXT
     )
     """,
     """
@@ -178,7 +179,11 @@ class LatchRecord:
     set_at: datetime.datetime | None
     cleared_at: datetime.datetime | None
     trigger_count: int
+    # The instance that last set or cleared this latch, and a one-line
+    # rendering of the event that did it. Outputs are given both, which is what
+    # lets a PagerDuty payload carry the subject line that caused it.
     last_cause: str | None
+    last_detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -542,14 +547,16 @@ class Store:
         """Write a latch record. Callers on the core thread only."""
         self._database.connection().execute(
             """
-            INSERT INTO latches (rule_name, state, set_at, cleared_at, trigger_count, last_cause)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO latches
+                (rule_name, state, set_at, cleared_at, trigger_count, last_cause, last_detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(rule_name) DO UPDATE SET
                 state = excluded.state,
                 set_at = excluded.set_at,
                 cleared_at = excluded.cleared_at,
                 trigger_count = excluded.trigger_count,
-                last_cause = excluded.last_cause
+                last_cause = excluded.last_cause,
+                last_detail = excluded.last_detail
             """,
             (
                 record.rule_name,
@@ -558,6 +565,7 @@ class Store:
                 None if record.cleared_at is None else to_iso(record.cleared_at),
                 record.trigger_count,
                 record.last_cause,
+                record.last_detail,
             ),
         )
 
@@ -944,6 +952,7 @@ def _latch_from_row(row: sqlite3.Row) -> LatchRecord:
         cleared_at=_optional_time(row["cleared_at"]),
         trigger_count=int(row["trigger_count"]),
         last_cause=None if row["last_cause"] is None else str(row["last_cause"]),
+        last_detail=None if row["last_detail"] is None else str(row["last_detail"]),
     )
 
 

@@ -19,7 +19,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from noti_mapper.messages import PushResultMessage
-from noti_mapper.plugin import OutputPlugin
+from noti_mapper.plugin import OutputPlugin, OutputUpdate
 
 ReportCallback = Callable[[PushResultMessage], None]
 
@@ -27,7 +27,7 @@ ReportCallback = Callable[[PushResultMessage], None]
 @dataclass(frozen=True)
 class _PushRequest:
     instance_name: str
-    value: bool
+    update: OutputUpdate
 
 
 class Dispatcher(abc.ABC):
@@ -51,7 +51,7 @@ class Dispatcher(abc.ABC):
         """Replace the output table, on reload."""
 
     @abc.abstractmethod
-    def dispatch(self, *, instance_name: str, value: bool) -> None:
+    def dispatch(self, *, instance_name: str, update: OutputUpdate) -> None:
         """Queue a push. Must return promptly; the core thread is waiting."""
 
 
@@ -102,9 +102,9 @@ class OutputDispatcher(Dispatcher):
             thread.join(timeout=10.0)
         self._threads.clear()
 
-    def dispatch(self, *, instance_name: str, value: bool) -> None:
+    def dispatch(self, *, instance_name: str, update: OutputUpdate) -> None:
         """Queue a push. Returns immediately."""
-        self._queue.put(_PushRequest(instance_name=instance_name, value=value))
+        self._queue.put(_PushRequest(instance_name=instance_name, update=update))
 
     def _worker(self) -> None:
         while True:
@@ -123,7 +123,7 @@ class OutputDispatcher(Dispatcher):
             self._report(
                 PushResultMessage(
                     instance_name=request.instance_name,
-                    pushed_value=request.value,
+                    pushed_value=request.update.state,
                     succeeded=False,
                     error="output instance is no longer configured",
                 )
@@ -131,18 +131,18 @@ class OutputDispatcher(Dispatcher):
             return
 
         try:
-            output.apply(request.value)
+            output.apply(request.update)
         except BaseException as error:  # noqa: BLE001 - a plugin must not kill the pool
             self._logger.warning(
                 "push to %s failed: %s",
                 request.instance_name,
                 error,
-                extra={"instance": request.instance_name, "value": request.value},
+                extra={"instance": request.instance_name, "value": request.update.state},
             )
             self._report(
                 PushResultMessage(
                     instance_name=request.instance_name,
-                    pushed_value=request.value,
+                    pushed_value=request.update.state,
                     succeeded=False,
                     error=f"{type(error).__name__}: {error}",
                 )
@@ -152,7 +152,7 @@ class OutputDispatcher(Dispatcher):
         self._report(
             PushResultMessage(
                 instance_name=request.instance_name,
-                pushed_value=request.value,
+                pushed_value=request.update.state,
                 succeeded=True,
             )
         )
