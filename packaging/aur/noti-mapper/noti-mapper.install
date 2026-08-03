@@ -1,0 +1,45 @@
+post_install() {
+    systemd-sysusers noti-mapper.conf >/dev/null 2>&1 || true
+
+    cat <<'MESSAGE'
+
+noti-mapper is installed but not configured. Nothing is watched yet.
+
+  1. Copy the examples from /usr/share/doc/noti-mapper/examples/ into
+     /etc/noti-mapper.d/ and edit them. They are not live where they are.
+
+  2. If you use secrets, put them in /etc/noti-mapper/secrets.json, mode 0600,
+     owned by the noti-mapper user. The daemon refuses to start otherwise.
+
+  3. Check your work:      noti-mapper validate
+  4. Then:                 systemctl enable --now noti-mapper
+
+The IMAP reader in the example ships with "dry_run": true. Leave it that way
+for a week and read the journal. It will tell you what it would have fired on,
+which is how you discover that your carrier also sends "Out for delivery"
+twice a day.
+
+The HomeKit output adds one accessory to your existing Apple Home. It does not
+migrate, bridge, or re-pair anything you already own. It does need mDNS on the
+same L2 segment as your Home hub; if your IoT devices are on their own VLAN you
+need an mDNS reflector.
+
+MESSAGE
+}
+
+post_upgrade() {
+    systemd-sysusers noti-mapper.conf >/dev/null 2>&1 || true
+}
+
+pre_remove() {
+    systemctl --quiet disable --now noti-mapper.service 2>/dev/null || true
+}
+
+post_remove() {
+    cat <<'MESSAGE'
+
+/var/lib/noti-mapper still holds latch state, and /etc/noti-mapper.d still
+holds your configuration. Neither is removed, in case this is a reinstall.
+
+MESSAGE
+}
