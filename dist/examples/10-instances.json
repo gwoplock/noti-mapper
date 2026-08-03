@@ -1,0 +1,34 @@
+{
+  "instances": {
+    "Porch Mail": {
+      "plugin": "imap-input",
+      "config": {
+        "host": "mail.example.net",
+        "username": "user@example.net",
+        "password": "${secret:porch_mail_password}",
+        "folder": "Packages",
+        "idle_refresh_seconds": 1500,
+        "senders": ["amazon.com", "ups.com", "fedex.com", "usps.com"],
+        "subject_patterns": ["^Delivered:"],
+        "dry_run": true
+      }
+    },
+
+    "Porch Lamp": {
+      "plugin": "homekit-output",
+      "config": {
+        "display_name": "Package Waiting"
+      }
+    },
+
+    "Porch Pager": {
+      "plugin": "pagerduty-output",
+      "config": {
+        "routing_key": "${secret:pagerduty_routing_key}",
+        "api_token": "${secret:pagerduty_api_token}",
+        "severity": "warning",
+        "poll_seconds": 45
+      }
+    }
+  }
+}
