@@ -11,6 +11,7 @@ from noti_mapper.discovery import (
     DiscoveryResult,
     default_search_path,
     discover,
+    known_plugins,
     source_checkout_plugin_directory,
 )
 from noti_mapper.plugin import (
@@ -267,6 +268,60 @@ def test_a_plugin_may_import_its_own_submodules(tmp_path: Path) -> None:
     result = _scan(tmp_path)
     assert result.failures == ()
     assert result.names() == ["multi-file"]
+
+
+# -- handing off to config validation -----------------------------------------
+
+
+def test_known_plugins_carries_directions_and_the_settings_validator(tmp_path: Path) -> None:
+    _write_plugin(tmp_path, "reader", _INPUT_SOURCE.format(plugin_name="test-input"))
+    known = known_plugins(_scan(tmp_path))
+
+    assert list(known) == ["test-input"]
+    entry = known["test-input"]
+    assert entry.directions == frozenset({PluginDirection.INPUT})
+    assert entry.validate_settings is not None
+    assert entry.validate_settings({}) == ['"host" is required']
+    assert entry.validate_settings({"host": "mail.example.net"}) == []
+
+
+def test_a_plugin_providing_both_directions_runs_both_validators(tmp_path: Path) -> None:
+    source = (
+        _INPUT_SOURCE.format(plugin_name="both")
+        + "\n\n"
+        + _OUTPUT_SOURCE.format(plugin_name="both").split("PLUGIN_NAME", 1)[0]
+        + """
+class Switch2(OutputPlugin):
+    @classmethod
+    def validate_settings(cls, settings):
+        return ['"port" is required']
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def apply(self, state: bool) -> None:
+        pass
+
+    def query(self) -> RemoteState:
+        return RemoteState(belief=RemoteBelief.UNKNOWN)
+
+    def health(self) -> PluginHealth:
+        return PluginHealth(status=HealthStatus.OK)
+
+
+OUTPUT_PLUGIN = Switch2
+"""
+    )
+    _write_plugin(tmp_path, "both", source)
+    known = known_plugins(_scan(tmp_path))
+    entry = known["both"]
+
+    assert entry.directions == frozenset({PluginDirection.INPUT, PluginDirection.OUTPUT})
+    assert entry.validate_settings is not None
+    assert entry.validate_settings({}) == ['"host" is required', '"port" is required']
 
 
 # -- the default search path --------------------------------------------------
