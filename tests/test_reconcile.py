@@ -7,6 +7,9 @@ to cover exhaustively.
 """
 
 import datetime
+import itertools
+
+import pytest
 
 from noti_mapper.plugin import RemoteBelief, RemoteState
 from noti_mapper.reconcile import resolve_rule
@@ -48,3 +51,55 @@ ACTIVE = RemoteState(belief=RemoteBelief.ACTIVE)
 CLEARED = RemoteState(belief=RemoteBelief.CLEARED, cleared_at=CLEAR_TIME)
 CLEARED_UNDATED = RemoteState(belief=RemoteBelief.CLEARED)
 UNKNOWN = RemoteState(belief=RemoteBelief.UNKNOWN)
+
+
+# -- the full matrix ----------------------------------------------------------
+
+# (persisted, event, report) -> expected state
+_MATRIX: dict[tuple[bool, str, str], bool] = {
+    # No event during downtime.
+    (True, "none", "active"): True,
+    (True, "none", "cleared"): False,
+    (True, "none", "unreachable"): True,
+    (False, "none", "active"): False,
+    (False, "none", "cleared"): False,
+    (False, "none", "unreachable"): False,
+    # An event that predates the clear: the clear is the later word.
+    (True, "before", "active"): True,
+    (True, "before", "cleared"): False,
+    (True, "before", "unreachable"): True,
+    (False, "before", "active"): True,
+    (False, "before", "cleared"): False,
+    (False, "before", "unreachable"): True,
+    # An event after the clear: this is the case that gets silently dropped.
+    (True, "after", "active"): True,
+    (True, "after", "cleared"): True,
+    (True, "after", "unreachable"): True,
+    (False, "after", "active"): True,
+    (False, "after", "cleared"): True,
+    (False, "after", "unreachable"): True,
+}
+
+_EVENTS = {"none": None, "before": BEFORE_CLEAR, "after": AFTER_CLEAR}
+_REPORTS = {"active": [ACTIVE], "cleared": [CLEARED], "unreachable": [UNKNOWN]}
+
+
+@pytest.mark.parametrize(
+    ("persisted", "event_key", "report_key"),
+    list(itertools.product([True, False], _EVENTS, _REPORTS)),
+)
+def test_the_reconciliation_matrix(persisted: bool, event_key: str, report_key: str) -> None:
+    expected = _MATRIX[(persisted, event_key, report_key)]
+    actual = _resolve(
+        persisted_state=persisted,
+        event=_EVENTS[event_key],
+        reports=list(_REPORTS[report_key]),
+    )
+    assert actual is expected, (
+        f"persisted={persisted} event={event_key} report={report_key}: "
+        f"expected {expected}, got {actual}"
+    )
+
+
+def test_the_matrix_is_complete() -> None:
+    assert len(_MATRIX) == 2 * len(_EVENTS) * len(_REPORTS)
