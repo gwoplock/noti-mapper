@@ -18,22 +18,25 @@ these by hand: ``noti-mapper rename "Package On Porch" "Porch Package"``.
 """
 
 import argparse
+import logging
 import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 from noti_mapper import VERSION
+from noti_mapper.clock import SystemClock
 from noti_mapper.config import (
     DEFAULT_CONFIG_DIRECTORY,
 )
 from noti_mapper.discovery import default_search_path
 from noti_mapper.logging_setup import configure as configure_logging
 from noti_mapper.logging_setup import level_from_name
-from noti_mapper.runtime import Paths
+from noti_mapper.runtime import Daemon, Paths, StartupError
 from noti_mapper.secrets import DEFAULT_SECRETS_PATH
 from noti_mapper.storage import (
     DEFAULT_STATE_DIRECTORY,
+    StorageError,
 )
 
 STATE_DIRECTORY_ENVIRONMENT = "STATE_DIRECTORY"
@@ -160,3 +163,25 @@ def _paths_from(arguments: argparse.Namespace) -> Paths:
         state_directory=Path(state_directory),
         plugin_directories=tuple(plugin_directories),
     )
+
+
+# -- run ----------------------------------------------------------------------
+
+
+def _run(paths: Paths) -> int:
+    log = logging.getLogger("noti_mapper")
+    daemon = Daemon(paths=paths, clock=SystemClock(), logger=log)
+    try:
+        daemon.start()
+    except StartupError as error:
+        log.error("%s", error)
+        return EXIT_CONFIG_ERROR
+    except StorageError as error:
+        log.error("%s", error)
+        return EXIT_FAILURE
+
+    try:
+        daemon.run()
+    finally:
+        daemon.stop()
+    return EXIT_OK
