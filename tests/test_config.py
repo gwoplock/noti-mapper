@@ -276,6 +276,19 @@ def test_unknown_instance_key_is_an_error(tmp_path: Path) -> None:
     assert any("unknown key 'conifg'" in error for error in errors)
 
 
+def test_unknown_rule_key_is_an_error(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "instances": {"A": {"plugin": "imap-input"}, "B": {"plugin": "homekit-output"}},
+            "rules": {"R": {"inputs": ["A"], "outputs": ["B"], "input": ["A"]}},
+        },
+    )
+    errors = _errors(tmp_path)
+    assert any("unknown key 'input'" in error for error in errors)
+
+
 def test_invalid_name_characters_are_rejected(tmp_path: Path) -> None:
     _write(tmp_path, "a.json", {"instances": {"Porch/Mail": {"plugin": "imap-input"}}})
     errors = _errors(tmp_path)
@@ -311,6 +324,172 @@ def test_enabled_must_be_a_boolean(tmp_path: Path) -> None:
     _write(tmp_path, "a.json", {"instances": {"A": {"plugin": "imap-input", "enabled": "yes"}}})
     errors = _errors(tmp_path)
     assert "must be true or false" in errors[0]
+
+
+# -- rule validation ----------------------------------------------------------
+
+
+def test_rule_referencing_an_unknown_instance(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "instances": {"Out": {"plugin": "homekit-output"}},
+            "rules": {"R": {"inputs": ["Nope"], "outputs": ["Out"]}},
+        },
+    )
+    errors = _errors(tmp_path)
+    assert "unknown instance 'Nope'" in errors[0]
+    assert "Defined instances: Out" in errors[0]
+
+
+def test_a_case_mismatched_reference_suggests_the_real_name(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "instances": {
+                "Porch Mail": {"plugin": "imap-input"},
+                "Out": {"plugin": "homekit-output"},
+            },
+            "rules": {"R": {"inputs": ["porch mail"], "outputs": ["Out"]}},
+        },
+    )
+    errors = _errors(tmp_path)
+    assert "did you mean 'Porch Mail'?" in errors[0]
+
+
+def test_an_output_instance_may_not_be_listed_as_an_input(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "instances": {
+                "Lamp": {"plugin": "homekit-output"},
+                "Mail": {"plugin": "imap-input"},
+            },
+            "rules": {"R": {"inputs": ["Lamp"], "outputs": ["Lamp"]}},
+        },
+    )
+    errors = _errors(tmp_path)
+    assert any("lists 'Lamp' under \"inputs\"" in error for error in errors)
+    assert any("provides only: output" in error for error in errors)
+
+
+def test_an_input_instance_may_not_be_listed_as_an_output(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "instances": {"Mail": {"plugin": "imap-input"}},
+            "rules": {"R": {"inputs": ["Mail"], "outputs": ["Mail"]}},
+        },
+    )
+    errors = _errors(tmp_path)
+    assert any('under "outputs"' in error for error in errors)
+
+
+def test_an_instance_may_not_be_both_input_and_output_of_one_rule(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "instances": {"Both": {"plugin": "loopback"}},
+            "rules": {"R": {"inputs": ["Both"], "outputs": ["Both"]}},
+        },
+    )
+    errors = _errors(tmp_path)
+    assert "would make the rule latch itself" in errors[0]
+
+
+def test_empty_inputs_or_outputs_is_an_error(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "instances": {"Out": {"plugin": "homekit-output"}},
+            "rules": {"R": {"inputs": [], "outputs": ["Out"]}},
+        },
+    )
+    errors = _errors(tmp_path)
+    assert "is empty" in errors[0]
+
+
+def test_missing_inputs_key_is_an_error(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "instances": {"Out": {"plugin": "homekit-output"}},
+            "rules": {"R": {"outputs": ["Out"]}},
+        },
+    )
+    errors = _errors(tmp_path)
+    assert 'has no "inputs"' in errors[0]
+
+
+def test_repeating_an_instance_in_one_list_is_an_error(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "instances": {
+                "In": {"plugin": "imap-input"},
+                "Out": {"plugin": "homekit-output"},
+            },
+            "rules": {"R": {"inputs": ["In", "In"], "outputs": ["Out"]}},
+        },
+    )
+    errors = _errors(tmp_path)
+    assert "is listed twice" in errors[0]
+
+
+def test_a_broken_instance_does_not_also_produce_unknown_instance_errors(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "instances": {
+                "In": {"plugin": "does-not-exist"},
+                "Out": {"plugin": "homekit-output"},
+            },
+            "rules": {"R": {"inputs": ["In"], "outputs": ["Out"]}},
+        },
+    )
+    errors = _errors(tmp_path)
+    assert len(errors) == 1
+    assert "unknown plugin" in errors[0]
+
+
+# -- one pass -----------------------------------------------------------------
+
+
+def test_every_error_is_reported_in_one_pass(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "instances": {
+                "Bad Plugin": {"plugin": "nope"},
+                "Bad/Name": {"plugin": "imap-input"},
+                "Out": {"plugin": "homekit-output", "enabled": "yes"},
+            },
+            "rules": {
+                "R1": {"inputs": ["Missing"], "outputs": ["Out"]},
+                "R2": {"inputs": [], "outputs": ["Out"]},
+            },
+        },
+    )
+    errors = _errors(tmp_path)
+    assert len(errors) == 5
+
+
+def test_errors_are_sorted_by_position(tmp_path: Path) -> None:
+    _write(tmp_path, "10-a.json", {"instances": {"A": {"plugin": "nope1"}}})
+    _write(tmp_path, "20-b.json", {"instances": {"B": {"plugin": "nope2"}}})
+    errors = _errors(tmp_path)
+    assert "10-a.json" in errors[0]
+    assert "20-b.json" in errors[1]
 
 
 # -- secrets ------------------------------------------------------------------
