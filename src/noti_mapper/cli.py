@@ -414,3 +414,56 @@ def _rename(paths: Paths, *, old_name: str, new_name: str) -> int:
     print(f"renamed rule {old!r} to {new!r}; its latch moved with it.")
     print("Update the configuration to match before starting the daemon.")
     return EXIT_OK
+
+
+# -- purge --------------------------------------------------------------------
+
+
+def _purge(paths: Paths, *, assume_yes: bool) -> int:
+    path = database_path(paths.state_directory)
+    if not path.exists():
+        print(f"noti-mapper: no state database at {path}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    database = Database(path=path)
+    try:
+        initialize(database)
+        store = Store(database=database)
+
+        orphan_rules = [record.name for record in store.rules() if record.orphaned]
+        orphan_instances = [record.name for record in store.instances() if record.orphaned]
+        if not orphan_rules and not orphan_instances:
+            print("nothing to purge.")
+            return EXIT_OK
+
+        print("This will permanently delete:")
+        for name in orphan_rules:
+            print(f"  rule {name!r} and its latch")
+        for name in orphan_instances:
+            print(f"  instance {name!r} and its stored plugin state")
+
+        if not assume_yes and not _confirm():
+            print("cancelled.")
+            return EXIT_OK
+
+        purged_rules, purged_instances = store.purge_orphans()
+        store.append_event(
+            at=SystemClock().now(),
+            kind=EventKind.PURGED,
+            detail=f"{len(purged_rules)} rules, {len(purged_instances)} instances",
+        )
+        print(f"purged {len(purged_rules)} rule(s) and {len(purged_instances)} instance(s).")
+    except StorageError as error:
+        print(f"noti-mapper: {error}", file=sys.stderr)
+        return EXIT_FAILURE
+    finally:
+        database.close()
+    return EXIT_OK
+
+
+def _confirm() -> bool:
+    if not sys.stdin.isatty():
+        print("noti-mapper: not a terminal; re-run with --yes to confirm.", file=sys.stderr)
+        return False
+    answer = input("Proceed? [y/N] ").strip().lower()
+    return answer in {"y", "yes"}
