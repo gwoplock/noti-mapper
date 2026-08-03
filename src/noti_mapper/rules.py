@@ -24,7 +24,7 @@ does this instance touch" and "what should this output be, given these
 latches", and nothing else.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 
@@ -77,3 +77,17 @@ class RuleGraph:
 
     def instance_names(self) -> list[str]:
         return sorted(set(self._by_input) | set(self._by_output))
+
+    def desired_output_state(self, *, instance_name: str, latches: Mapping[str, bool]) -> bool:
+        """An output is true when any rule listing it as an output is latched."""
+        return any(latches.get(rule.name, False) for rule in self._by_output.get(instance_name, []))
+
+    def outputs_affected_by(self, rule_names: Sequence[str]) -> list[str]:
+        """Every output instance whose state could change if these rules changed."""
+        affected: set[str] = set()
+        for rule_name in rule_names:
+            rule = self._rules.get(rule_name)
+            if rule is None:
+                continue
+            affected.update(rule.outputs)
+        return sorted(affected)
