@@ -105,6 +105,92 @@ def test_a_file_that_disappears_mid_debounce_fires_nothing(
     assert harness.events == []
 
 
+# -- what counts as new -------------------------------------------------------
+
+
+def test_an_unchanged_file_does_not_fire_twice(watched: Path, database: Database) -> None:
+    harness = _harness(watched, database, glob="*.txt")
+    (watched / "package.txt").write_text("one", encoding="utf-8")
+    for _ in range(4):
+        harness.poll()
+    assert len(harness.events) == 1
+
+    for _ in range(4):
+        harness.poll()
+    assert len(harness.events) == 1
+
+
+def test_a_modified_file_fires_again(watched: Path, database: Database) -> None:
+    harness = _harness(watched, database, glob="*.txt")
+    target = watched / "package.txt"
+
+    target.write_text("one", encoding="utf-8")
+    for _ in range(3):
+        harness.poll()
+    assert len(harness.events) == 1
+
+    target.write_text("two and a bit longer", encoding="utf-8")
+    for _ in range(3):
+        harness.poll()
+    assert len(harness.events) == 2
+
+
+def test_emit_on_modify_false_fires_only_on_creation(watched: Path, database: Database) -> None:
+    harness = _harness(watched, database, glob="*.txt", emit_on_modify=False)
+    target = watched / "package.txt"
+
+    target.write_text("one", encoding="utf-8")
+    for _ in range(3):
+        harness.poll()
+    assert len(harness.events) == 1
+
+    target.write_text("changed", encoding="utf-8")
+    for _ in range(3):
+        harness.poll()
+    assert len(harness.events) == 1
+
+
+def test_the_seen_cursor_survives_a_new_plugin_instance(watched: Path, database: Database) -> None:
+    first = _harness(watched, database, glob="*.txt")
+    (watched / "package.txt").write_text("one", encoding="utf-8")
+    for _ in range(3):
+        first.poll()
+    assert len(first.events) == 1
+
+    second = _harness(watched, database, glob="*.txt")
+    for _ in range(3):
+        second.poll()
+    assert second.events == []
+
+
+# -- globs and single files ---------------------------------------------------
+
+
+def test_the_glob_filters_the_directory(watched: Path, database: Database) -> None:
+    harness = _harness(watched, database, glob="*.txt")
+    (watched / "wanted.txt").write_text("a", encoding="utf-8")
+    (watched / "ignored.log").write_text("b", encoding="utf-8")
+    for _ in range(3):
+        harness.poll()
+
+    assert harness.paths() == [str(watched / "wanted.txt")]
+
+
+def test_without_a_glob_a_single_file_is_watched(watched: Path, database: Database) -> None:
+    target = watched / "one.txt"
+    harness = _harness(target, database)
+
+    (watched / "other.txt").write_text("no", encoding="utf-8")
+    for _ in range(3):
+        harness.poll()
+    assert harness.events == []
+
+    target.write_text("yes", encoding="utf-8")
+    for _ in range(3):
+        harness.poll()
+    assert harness.paths() == [str(target)]
+
+
 # -- settings -----------------------------------------------------------------
 
 
