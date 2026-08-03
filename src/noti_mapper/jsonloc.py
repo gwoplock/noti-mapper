@@ -102,6 +102,11 @@ def parse(*, text: str, path: Path) -> JsonNode:
     return parser.parse_document()
 
 
+def parse_file(path: Path) -> JsonNode:
+    """Read and parse a JSON file."""
+    return parse(text=path.read_text(encoding="utf-8"), path=path)
+
+
 def to_plain(node: JsonNode) -> object:
     """Strip locations, returning ordinary Python objects.
 
