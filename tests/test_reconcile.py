@@ -198,3 +198,63 @@ def test_an_unreachable_output_does_not_veto_a_reachable_one() -> None:
         output_reports=[UNKNOWN, CLEARED],
     )
     assert outcome.state is False
+
+
+# -- persisted state is authoritative where nothing contradicts it ------------
+
+
+def test_a_stale_active_remote_does_not_resurrect_a_cleared_latch() -> None:
+    outcome = resolve_rule(
+        now=NOW,
+        persisted=_latch(state=False),
+        latest_downtime_event=None,
+        output_reports=[ACTIVE],
+    )
+    assert outcome.state is False
+    assert "deliberately cleared" in outcome.reason
+
+
+def test_no_reports_at_all_falls_back_to_persisted_state() -> None:
+    for persisted in (True, False):
+        outcome = resolve_rule(
+            now=NOW,
+            persisted=_latch(state=persisted),
+            latest_downtime_event=None,
+            output_reports=[],
+        )
+        assert outcome.state is persisted
+        assert "persisted state stands" in outcome.reason
+
+
+def test_a_downtime_event_moves_set_at_forward_on_an_already_set_latch() -> None:
+    outcome = resolve_rule(
+        now=NOW,
+        persisted=_latch(state=True, set_at=BEFORE_CLEAR),
+        latest_downtime_event=AFTER_CLEAR,
+        output_reports=[UNKNOWN],
+    )
+    assert outcome.state is True
+    assert outcome.set_at == AFTER_CLEAR
+
+
+def test_an_older_downtime_event_does_not_move_set_at_backwards() -> None:
+    outcome = resolve_rule(
+        now=NOW,
+        persisted=_latch(state=True, set_at=AFTER_CLEAR),
+        latest_downtime_event=BEFORE_CLEAR,
+        output_reports=[UNKNOWN],
+    )
+    assert outcome.set_at == AFTER_CLEAR
+
+
+def test_changed_from_compares_state_only() -> None:
+    persisted = _latch(state=False)
+    outcome = resolve_rule(
+        now=NOW, persisted=persisted, latest_downtime_event=AFTER_CLEAR, output_reports=[]
+    )
+    assert outcome.changed_from(persisted) is True
+
+    unchanged = resolve_rule(
+        now=NOW, persisted=persisted, latest_downtime_event=None, output_reports=[]
+    )
+    assert unchanged.changed_from(persisted) is False
