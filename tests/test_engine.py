@@ -563,6 +563,46 @@ def test_a_failing_catch_up_does_not_block_startup(tmp_path: Path) -> None:
         assert harness.latch("R") is False
 
 
+def test_a_retried_catch_up_latches_what_it_finds(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        harness.inputs["Mail"].configure(
+            FakeInputBehaviour(catch_up_raises=RuntimeError("IMAP unavailable"))
+        )
+        harness.engine.reconcile()
+        assert harness.latch("R") is False
+
+        harness.inputs["Mail"].configure(
+            FakeInputBehaviour(catch_up_events=[ObservedEvent(occurred_at=START)])
+        )
+        harness.clock.advance(60)
+        harness.engine.drain()
+
+        assert harness.latch("R") is True
+        assert harness.applied("Lamp")[-1] is True
+
+
+def test_a_retried_output_query_reconciles_that_output(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        harness.fire("Mail")
+
+    for restarted in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        restarted.outputs["Lamp"].configure(
+            FakeOutputBehaviour(query_result=RemoteState(belief=RemoteBelief.UNKNOWN))
+        )
+        restarted.engine.reconcile()
+        assert restarted.latch("R") is True
+
+        restarted.outputs["Lamp"].configure(
+            FakeOutputBehaviour(
+                query_result=RemoteState(belief=RemoteBelief.CLEARED, cleared_at=START)
+            )
+        )
+        restarted.clock.advance(60)
+        restarted.engine.drain()
+
+        assert restarted.latch("R") is False
+
+
 def test_catch_up_is_given_the_last_time_the_daemon_ran(tmp_path: Path) -> None:
     for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
         harness.engine.reconcile()
