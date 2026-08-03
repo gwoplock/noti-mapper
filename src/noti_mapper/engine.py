@@ -16,6 +16,7 @@ import datetime
 import logging
 import queue
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from noti_mapper.clock import Clock
@@ -44,6 +45,8 @@ from noti_mapper.storage import (
     HealthRecord,
     HealthStatus,
     LatchRecord,
+    OutputStateRecord,
+    PendingPush,
     Store,
 )
 
@@ -288,6 +291,120 @@ class Engine:
             self._handle_poll_health()
         else:
             self._stopping = True
+
+    # -- push results ---------------------------------------------------------
+
+    def _handle_push_result(self, message: PushResultMessage) -> None:
+        now = self._clock.now()
+        self._in_flight.discard(message.instance_name)
+
+        with self._store.database.transaction():
+            if message.succeeded:
+                self._store.write_output_state(
+                    OutputStateRecord(
+                        instance_name=message.instance_name,
+                        last_applied=message.pushed_value,
+                        last_confirmed=message.pushed_value,
+                        last_sync_at=now,
+                    )
+                )
+                self._append_event(
+                    at=now,
+                    kind=EventKind.OUTPUT_PUSH_SUCCEEDED,
+                    instance_name=message.instance_name,
+                    detail=f"value={message.pushed_value}",
+                )
+                self._log.info(
+                    "pushed %s to %s",
+                    message.pushed_value,
+                    message.instance_name,
+                    extra={"instance": message.instance_name, "value": message.pushed_value},
+                )
+            else:
+                self._record_push_failure(message=message, now=now)
+
+            self._sync_outputs([message.instance_name], now=now)
+
+    def _record_push_failure(self, *, message: PushResultMessage, now: datetime.datetime) -> None:
+        existing = self._store.pending_push(message.instance_name)
+        attempts = 1 if existing is None else existing.attempt_count + 1
+        delay = self._backoff_seconds(attempts)
+        self._store.write_pending_push(
+            PendingPush(
+                instance_name=message.instance_name,
+                target_value=message.pushed_value,
+                attempt_count=attempts,
+                next_attempt_at=now + datetime.timedelta(seconds=delay),
+                last_error=message.error,
+            )
+        )
+        self._append_event(
+            at=now,
+            kind=EventKind.OUTPUT_PUSH_FAILED,
+            instance_name=message.instance_name,
+            detail=f"attempt={attempts} retry_in={delay:.0f}s {message.error or ''}".strip(),
+        )
+        self._log.warning(
+            "push to %s failed (attempt %d), retrying in %.0fs: %s",
+            message.instance_name,
+            attempts,
+            delay,
+            message.error,
+            extra={
+                "instance": message.instance_name,
+                "attempt": attempts,
+                "retry_in_seconds": delay,
+            },
+        )
+
+    def _backoff_seconds(self, attempts: int) -> float:
+        initial = self._settings.retry_initial_seconds
+        maximum = self._settings.retry_max_seconds
+        delay: float = initial * float(2 ** max(0, attempts - 1))
+        if delay > maximum:
+            return maximum
+        return delay
+
+    # -- output synchronisation -----------------------------------------------
+
+    def _sync_outputs(self, instance_names: Sequence[str], *, now: datetime.datetime) -> None:
+        for instance_name in instance_names:
+            self._sync_output(instance_name, now=now, force=False)
+
+    def _sync_output(self, instance_name: str, *, now: datetime.datetime, force: bool) -> None:
+        """Make the pending-push table agree with what this output should be.
+
+        ``force`` is used by startup reconciliation, which pushes every output
+        whether or not the daemon believes it is already correct. That is what
+        step 5 -- "force every output into agreement" -- means, and it is why
+        ``apply`` is required to be idempotent.
+        """
+        desired = self._graph.desired_output_state(
+            instance_name=instance_name, latches=self.latch_states()
+        )
+        record = self._store.output_state(instance_name)
+        last_applied = None if record is None else record.last_applied
+        existing = self._store.pending_push(instance_name)
+
+        if not force and last_applied == desired:
+            if existing is not None:
+                self._store.delete_pending_push(instance_name)
+            return
+
+        if not force and existing is not None and existing.target_value == desired:
+            # A retry is already scheduled for this value. Leave its backoff
+            # alone rather than resetting it on every unrelated state change.
+            return
+
+        self._store.write_pending_push(
+            PendingPush(
+                instance_name=instance_name,
+                target_value=desired,
+                attempt_count=0,
+                next_attempt_at=now,
+                last_error=None,
+            )
+        )
 
     def _dispatch_due_pushes(self, now: datetime.datetime) -> None:
         due = self._store.pending_pushes_due(now)
