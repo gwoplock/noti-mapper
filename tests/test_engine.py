@@ -1,4 +1,5 @@
 import datetime
+import json
 import logging
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -8,16 +9,22 @@ import pytest
 
 from noti_mapper.clock import ManualClock
 from noti_mapper.config import (
+    Configuration,
     DaemonSettings,
+    KnownPlugin,
+    PluginDirection,
+    load_configuration,
 )
 from noti_mapper.engine import Engine, PluginSet
 from noti_mapper.messages import (
     InputEventMessage,
     PushResultMessage,
+    ReloadMessage,
     UnlatchRequestMessage,
 )
 from noti_mapper.plugin import ObservedEvent, RemoteBelief, RemoteState
 from noti_mapper.rules import Rule, RuleGraph
+from noti_mapper.secrets import empty_store
 from noti_mapper.storage import (
     Database,
     EventKind,
@@ -643,3 +650,117 @@ def test_a_plugin_raising_from_health_is_recorded_as_failed(simple: Harness) -> 
     records = {record.instance_name: record for record in simple.store.health()}
     assert records["Lamp"].status is HealthStatus.FAILED
     assert "kaboom" in records["Lamp"].detail
+
+
+# -- reload -------------------------------------------------------------------
+
+
+def _configuration(tmp_path: Path, document: object) -> Configuration:
+    directory = tmp_path / "conf"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "config.json").write_text(json.dumps(document), encoding="utf-8")
+    return load_configuration(
+        config_directory=directory,
+        secrets=empty_store(Path("secrets.json")),
+        known_plugins={
+            "fake-input": KnownPlugin(
+                plugin_name="fake-input", directions=frozenset({PluginDirection.INPUT})
+            ),
+            "fake-output": KnownPlugin(
+                plugin_name="fake-output", directions=frozenset({PluginDirection.OUTPUT})
+            ),
+        },
+    )
+
+
+def test_removing_a_rule_on_reload_drops_its_outputs(tmp_path: Path) -> None:
+    rules = {"A": (["Mail"], ["Lamp"]), "B": (["Hook"], ["Pager"])}
+    for harness in _build(tmp_path, rules=rules):
+        harness.fire("Mail")
+        harness.fire("Hook")
+        assert harness.applied("Lamp") == [True]
+        assert harness.applied("Pager") == [True]
+
+        reduced = _configuration(
+            tmp_path,
+            {
+                "instances": {
+                    "Mail": {"plugin": "fake-input"},
+                    "Hook": {"plugin": "fake-input"},
+                    "Lamp": {"plugin": "fake-output"},
+                    "Pager": {"plugin": "fake-output"},
+                },
+                "rules": {"A": {"inputs": ["Mail"], "outputs": ["Lamp"]}},
+            },
+        )
+        harness.store.sync_rules(
+            [
+                RuleRecord(
+                    name=rule.name,
+                    enabled=rule.enabled,
+                    orphaned=False,
+                    inputs=rule.inputs,
+                    outputs=rule.outputs,
+                )
+                for rule in reduced.rules.values()
+            ]
+        )
+        harness.engine.submit(ReloadMessage(configuration=reduced))
+        harness.engine.drain()
+
+        # Rule B is orphaned. Its latch record persists, but it stops
+        # contributing to output state immediately, so Pager drops.
+        assert harness.applied("Lamp") == [True]
+        assert harness.applied("Pager") == [True, False]
+
+        orphan = harness.store.latch("B")
+        assert orphan is not None
+        assert orphan.state is True
+
+        by_name = {rule.name: rule for rule in harness.store.rules()}
+        assert by_name["B"].orphaned is True
+
+
+def test_reload_leaves_unrelated_latches_alone(tmp_path: Path) -> None:
+    rules = {"A": (["Mail"], ["Lamp"]), "B": (["Hook"], ["Pager"])}
+    for harness in _build(tmp_path, rules=rules):
+        harness.fire("Mail")
+        harness.fire("Hook")
+
+        unchanged = _configuration(
+            tmp_path,
+            {
+                "instances": {
+                    "Mail": {"plugin": "fake-input"},
+                    "Hook": {"plugin": "fake-input"},
+                    "Lamp": {"plugin": "fake-output"},
+                    "Pager": {"plugin": "fake-output"},
+                },
+                "rules": {
+                    "A": {"inputs": ["Mail"], "outputs": ["Lamp"]},
+                    "B": {"inputs": ["Hook"], "outputs": ["Pager"]},
+                    "C": {"inputs": ["Mail"], "outputs": ["Pager"]},
+                },
+            },
+        )
+        harness.store.sync_rules(
+            [
+                RuleRecord(
+                    name=rule.name,
+                    enabled=rule.enabled,
+                    orphaned=False,
+                    inputs=rule.inputs,
+                    outputs=rule.outputs,
+                )
+                for rule in unchanged.rules.values()
+            ]
+        )
+        harness.engine.submit(ReloadMessage(configuration=unchanged))
+        harness.engine.drain()
+
+        assert harness.latch("A") is True
+        assert harness.latch("B") is True
+        assert harness.latch("C") is False
+        assert harness.applied("Lamp") == [True]
+        assert harness.applied("Pager") == [True]
+        assert EventKind.CONFIG_LOADED in harness.event_kinds()

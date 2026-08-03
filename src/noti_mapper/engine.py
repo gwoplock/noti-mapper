@@ -20,7 +20,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from noti_mapper.clock import Clock
-from noti_mapper.config import DaemonSettings
+from noti_mapper.config import Configuration, DaemonSettings
 from noti_mapper.dispatcher import Dispatcher
 from noti_mapper.messages import (
     CatchUpMessage,
@@ -586,6 +586,37 @@ class Engine:
         for instance_name, value in ready:
             self._in_flight.add(instance_name)
             self._dispatcher.dispatch(instance_name=instance_name, value=value)
+
+    # -- reload ---------------------------------------------------------------
+
+    def _handle_reload(self, message: ReloadMessage) -> None:
+        now = self._clock.now()
+        previous_outputs = set(self._graph.output_names())
+
+        self._graph = RuleGraph.from_configuration(message.configuration, logger=self._log)
+        self.reload_latches()
+
+        with self._store.database.transaction():
+            self._append_event(
+                at=now,
+                kind=EventKind.CONFIG_LOADED,
+                detail=f"{len(message.configuration.rules)} rules, "
+                f"{len(message.configuration.instances)} instances",
+            )
+            affected = sorted(previous_outputs | set(self._graph.output_names()))
+            self._sync_outputs(affected, now=now)
+
+        self._log.info(
+            "configuration reloaded: %d rules, %d instances",
+            len(message.configuration.rules),
+            len(message.configuration.instances),
+        )
+
+    def adopt(self, *, configuration: Configuration, plugins: PluginSet) -> None:
+        """Swap in a new plugin set and configuration. Core thread only."""
+        self._plugins = plugins
+        self._dispatcher.set_outputs(plugins.outputs)
+        self._handle_reload(ReloadMessage(configuration=configuration))
 
     # -- health ---------------------------------------------------------------
 
