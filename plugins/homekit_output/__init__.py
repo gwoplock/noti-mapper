@@ -137,9 +137,163 @@ class HomeKitOutput(OutputPlugin):
         self._detail = "not yet started"
         self._desired = False
 
+    # -- lifecycle ------------------------------------------------------------
+
+    def build_accessory(self) -> None:
+        """Construct the driver and the Switch, without advertising anything.
+
+        Split from :meth:`start` because everything that can be got wrong about
+        the accessory -- its name, its characteristics, where pairing state
+        lives -- is decided here, while the part that follows brings up mDNS and
+        binds a socket. Keeping them separate means the first can be exercised
+        without the second.
+        """
+        persist_file = self.context.state_path(PERSIST_FILENAME)
+        first_run = not persist_file.exists()
+
+        driver = AccessoryDriver(
+            port=self._port,
+            address=None if self._address is None else str(self._address),
+            persist_file=str(persist_file),
+            pincode=self._pincode(),
+        )
+        accessory = LatchSwitch(driver=driver, display_name=self._display_name, plugin=self)
+        driver.add_accessory(accessory=accessory)
+
+        self._driver = driver
+        self._accessory = accessory
+        self._persist_file = persist_file
+        self._first_run = first_run
+
+    def _pincode(self) -> bytes:
+        """The setup code, generated once and kept.
+
+        HAP-python persists the pairing itself but not the setup code, so a
+        restart before the user has finished pairing would otherwise print a
+        different code than the one in the journal a minute earlier.
+        """
+        stored = self.context.storage.get(PINCODE_KEY)
+        if stored is not None:
+            return stored.encode("ascii")
+        generated: bytes = pyhap_util.generate_pincode()
+        self.context.storage.set(PINCODE_KEY, generated.decode("ascii"))
+        return generated
+
+    def start(self) -> None:
+        try:
+            self.build_accessory()
+        except Exception as error:
+            self._set_health(HealthStatus.FAILED, f"{type(error).__name__}: {error}")
+            self._log.error(
+                "HomeKit accessory %r failed to start: %s",
+                self._display_name,
+                error,
+                extra={"instance": self.context.instance_name},
+                exc_info=True,
+            )
+            return
+
+        driver = self._driver
+        assert driver is not None
+        self._thread = threading.Thread(
+            target=driver.start, name=f"homekit-{self.context.instance_name}", daemon=True
+        )
+        self._thread.start()
+
+        self._set_health(HealthStatus.OK, f"accessory {self._display_name!r} on port {self._port}")
+        self._log.info(
+            "HomeKit accessory %r listening on port %d; pairing state in %s",
+            self._display_name,
+            self._port,
+            self._persist_file,
+            extra={"instance": self.context.instance_name},
+        )
+        if self._first_run:
+            self._log.info(
+                "not yet paired. Add the accessory in the Home app with setup code %s. "
+                "This adds one accessory to your existing home; nothing you already "
+                "own is affected.",
+                driver.state.pincode.decode("utf-8"),
+                extra={"instance": self.context.instance_name},
+            )
+
+    def stop(self) -> None:
+        driver = self._driver
+        if driver is None:
+            return
+
+        if self._thread is not None and self._thread.is_alive():
+            try:
+                driver.stop()
+            except Exception as error:
+                self._log.warning(
+                    "HomeKit driver did not stop cleanly: %s",
+                    error,
+                    extra={"instance": self.context.instance_name},
+                )
+            self._thread.join(timeout=STOP_TIMEOUT_SECONDS)
+        else:
+            # Built but never served -- start() failed, or the accessory was
+            # only constructed. The event loop and executor the driver made at
+            # construction still need releasing; nothing else will do it.
+            _release(driver, self._log)
+
+        self._driver = None
+        self._accessory = None
+        self._thread = None
+        self._set_health(HealthStatus.STOPPED, "not running")
+
     def health(self) -> PluginHealth:
         with self._state_lock:
             return PluginHealth(status=self._status, detail=self._detail)
+
+    # -- the write direction --------------------------------------------------
+
+    def apply(self, update: OutputUpdate) -> None:
+        accessory = self._accessory
+        if accessory is None:
+            raise PluginError("the HomeKit accessory is not running")
+
+        with self._state_lock:
+            self._desired = update.state
+        accessory.set_state(update.state)
+        self._log.debug(
+            "HomeKit switch %r set to %s (%s)",
+            self._display_name,
+            update.state,
+            update.summary(),
+            extra={"instance": self.context.instance_name, "value": update.state},
+        )
+
+    # -- the reverse direction ------------------------------------------------
+
+    def characteristic_written(self, value: bool) -> None:
+        """A controller wrote the On characteristic.
+
+        False is an unlatch. True is accepted and then corrected, because only
+        an input can set a latch -- see the module docstring.
+        """
+        if not value:
+            self._log.info(
+                "HomeKit switch %r written false; requesting unlatch",
+                self._display_name,
+                extra={"instance": self.context.instance_name},
+            )
+            self.request_unlatch("HomeKit switch written false")
+            return
+
+        with self._state_lock:
+            desired = self._desired
+        self._log.info(
+            "HomeKit switch %r written true; only an input can set a latch, so the "
+            "switch is being returned to %s",
+            self._display_name,
+            desired,
+            extra={"instance": self.context.instance_name},
+        )
+        accessory = self._accessory
+        if accessory is not None:
+            accessory.set_state(desired)
 
     def query(self) -> RemoteState:
         """HomeKit holds no state of its own; see the module docstring."""
@@ -149,3 +303,17 @@ class HomeKitOutput(OutputPlugin):
         with self._state_lock:
             self._status = status
             self._detail = detail
+
+
+def _release(driver: AccessoryDriver, log: logging.Logger) -> None:
+    """Give back the event loop and thread pool an unstarted driver is holding."""
+    try:
+        if driver.executor is not None:
+            driver.executor.shutdown(wait=False)
+        if not driver.loop.is_closed():
+            driver.loop.close()
+    except Exception as error:
+        log.debug("releasing an unstarted HomeKit driver: %s", error)
+
+
+OUTPUT_PLUGIN = HomeKitOutput
