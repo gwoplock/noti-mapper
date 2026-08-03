@@ -18,6 +18,7 @@ Two things make that work in practice:
 import enum
 import logging
 import os
+import sys
 
 # Attributes every LogRecord has. Anything else on a record came from an
 # `extra=` argument and is worth printing.
@@ -106,3 +107,25 @@ def _extras_of(record: logging.LogRecord) -> str:
             continue
         parts.append(f"{key}={vars(record)[key]!r}")
     return " ".join(parts)
+
+
+def configure(*, level: int = logging.INFO, journal: bool | None = None) -> None:
+    """Install the stderr handler. Call once, early."""
+    use_journal = running_under_journal() if journal is None else journal
+
+    handler = logging.StreamHandler(stream=sys.stderr)
+    handler.setFormatter(StructuredFormatter(journal=use_journal))
+
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
+    root.setLevel(level)
+
+
+def level_from_name(name: str) -> int:
+    """Turn ``--log-level warning`` into a logging constant."""
+    resolved = logging.getLevelNamesMapping().get(name.upper())
+    if resolved is None:
+        raise ValueError(f"unknown log level {name!r}")
+    return resolved

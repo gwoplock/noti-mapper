@@ -6,6 +6,8 @@ import pytest
 from noti_mapper.logging_setup import (
     StructuredFormatter,
     SyslogPriority,
+    configure,
+    level_from_name,
     priority_for,
     running_under_journal,
 )
@@ -94,6 +96,18 @@ def test_exceptions_are_included() -> None:
     assert "Traceback" in line
 
 
+def test_configure_installs_exactly_one_handler() -> None:
+    configure(level=logging.DEBUG, journal=False)
+    configure(level=logging.DEBUG, journal=False)
+    root = logging.getLogger()
+    try:
+        assert len(root.handlers) == 1
+        assert root.level == logging.DEBUG
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+
+
 def test_configured_logging_writes_extras_to_the_stream() -> None:
     stream = io.StringIO()
     handler = logging.StreamHandler(stream=stream)
@@ -109,6 +123,13 @@ def test_configured_logging_writes_extras_to_the_stream() -> None:
     written = stream.getvalue()
     assert "rule latched" in written
     assert "cause='Mail'" in written
+
+
+def test_level_names_are_case_insensitive() -> None:
+    assert level_from_name("warning") == logging.WARNING
+    assert level_from_name("DEBUG") == logging.DEBUG
+    with pytest.raises(ValueError, match="unknown log level"):
+        level_from_name("chatty")
 
 
 def test_journal_detection_reads_the_environment(
