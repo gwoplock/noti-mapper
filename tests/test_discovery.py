@@ -167,6 +167,79 @@ def test_non_plugin_directories_are_ignored(tmp_path: Path) -> None:
     assert result.failures == ()
 
 
+# -- failures are survivable --------------------------------------------------
+
+
+def test_a_plugin_that_raises_on_import_is_logged_and_skipped(tmp_path: Path) -> None:
+    _write_plugin(tmp_path, "broken", "raise RuntimeError('no thanks')\n")
+    _write_plugin(tmp_path, "working", _INPUT_SOURCE.format(plugin_name="test-input"))
+
+    result = _scan(tmp_path)
+    assert result.names() == ["test-input"]
+    assert len(result.failures) == 1
+    assert "RuntimeError: no thanks" in result.failures[0].message
+    assert "no thanks" in result.failures[0].traceback_text
+
+
+def test_a_plugin_importing_a_missing_library_is_skipped(tmp_path: Path) -> None:
+    _write_plugin(tmp_path, "needy", "import a_library_that_does_not_exist\n")
+    result = _scan(tmp_path)
+    assert result.plugins == {}
+    assert "ModuleNotFoundError" in result.failures[0].message
+
+
+def test_a_plugin_without_a_name_is_rejected(tmp_path: Path) -> None:
+    _write_plugin(tmp_path, "anon", "INPUT_PLUGIN = None\n")
+    result = _scan(tmp_path)
+    assert "does not define PLUGIN_NAME" in result.failures[0].message
+
+
+def test_a_plugin_with_an_empty_name_is_rejected(tmp_path: Path) -> None:
+    _write_plugin(tmp_path, "blank", "PLUGIN_NAME = '   '\nINPUT_PLUGIN = None\n")
+    result = _scan(tmp_path)
+    assert "non-empty string" in result.failures[0].message
+
+
+def test_a_plugin_with_neither_class_is_rejected(tmp_path: Path) -> None:
+    _write_plugin(tmp_path, "useless", "PLUGIN_NAME = 'useless'\n")
+    result = _scan(tmp_path)
+    assert "neither INPUT_PLUGIN nor OUTPUT_PLUGIN" in result.failures[0].message
+
+
+def test_a_class_not_subclassing_the_base_is_rejected(tmp_path: Path) -> None:
+    _write_plugin(
+        tmp_path,
+        "wrong",
+        "PLUGIN_NAME = 'wrong'\n\n\nclass NotAPlugin:\n    pass\n\n\nINPUT_PLUGIN = NotAPlugin\n",
+    )
+    result = _scan(tmp_path)
+    assert "does not subclass InputPlugin" in result.failures[0].message
+
+
+def test_a_non_class_reference_is_rejected(tmp_path: Path) -> None:
+    _write_plugin(tmp_path, "notaclass", "PLUGIN_NAME = 'x'\nINPUT_PLUGIN = 42\n")
+    result = _scan(tmp_path)
+    assert "is not a class" in result.failures[0].message
+
+
+def test_an_incomplete_subclass_names_the_missing_methods(tmp_path: Path) -> None:
+    source = (
+        "from noti_mapper.plugin import InputPlugin\n\n"
+        "PLUGIN_NAME = 'partial'\n\n\n"
+        "class Partial(InputPlugin):\n"
+        "    def start(self) -> None:\n"
+        "        pass\n\n\n"
+        "INPUT_PLUGIN = Partial\n"
+    )
+    _write_plugin(tmp_path, "partial", source)
+    result = _scan(tmp_path)
+    message = result.failures[0].message
+    assert "does not implement" in message
+    assert "catch_up" in message
+    assert "health" in message
+    assert "stop" in message
+
+
 # -- multi-file plugins -------------------------------------------------------
 
 
