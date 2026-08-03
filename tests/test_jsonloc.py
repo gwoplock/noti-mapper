@@ -4,8 +4,10 @@ from pathlib import Path
 import pytest
 
 from noti_mapper.jsonloc import (
+    MAX_DEPTH,
     JsonArray,
     JsonObject,
+    JsonParseError,
     JsonScalar,
     parse,
     parse_file,
@@ -60,6 +62,65 @@ def test_location_str_is_file_line_column() -> None:
     document = parse(text='{"a": 1}', path=Path("/etc/noti-mapper.d/10-a.json"))
     assert isinstance(document, JsonObject)
     assert str(document.key_locations["a"]) == "/etc/noti-mapper.d/10-a.json:1:2"
+
+
+def test_duplicate_keys_are_an_error() -> None:
+    text = '{\n  "a": 1,\n  "a": 2\n}'
+    with pytest.raises(JsonParseError) as caught:
+        parse(text=text, path=Path("a.json"))
+    assert "duplicate key 'a'" in caught.value.message
+    assert "a.json:2:3" in caught.value.message
+    assert caught.value.location.line == 3
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "   ",
+        "{",
+        "}",
+        "[1,]",
+        '{"a": 1,}',
+        '{"a" 1}',
+        "{a: 1}",
+        "{'a': 1}",
+        "// comment\n{}",
+        "{} {}",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        '{"a": 01}',
+        '{"a": +1}',
+        '{"a": .5}',
+        '{"a": 1.}',
+        '"unterminated',
+        '"bad escape \\x"',
+        '"raw control \x01"',
+        '"truncated \\u00"',
+        '"bad hex \\u00zz"',
+    ],
+)
+def test_malformed_documents_are_rejected(text: str) -> None:
+    with pytest.raises(JsonParseError):
+        parse(text=text, path=Path("a.json"))
+
+
+def test_surrogate_pairs_become_one_character() -> None:
+    node = parse(text='"\\ud83d\\ude00"', path=Path("a.json"))
+    assert isinstance(node, JsonScalar)
+    assert node.value == "\U0001f600"
+
+
+def test_depth_limit_is_enforced() -> None:
+    text = "[" * (MAX_DEPTH + 1) + "]" * (MAX_DEPTH + 1)
+    with pytest.raises(JsonParseError, match="nesting deeper"):
+        parse(text=text, path=Path("a.json"))
+
+
+def test_depth_just_below_the_limit_is_accepted() -> None:
+    text = "[" * MAX_DEPTH + "]" * MAX_DEPTH
+    parse(text=text, path=Path("a.json"))
 
 
 def test_arrays_and_objects_carry_their_opening_location() -> None:
