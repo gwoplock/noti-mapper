@@ -5,7 +5,11 @@ import pytest
 
 from noti_mapper.secrets import (
     SecretsError,
+    SecretStore,
+    empty_store,
     load_secrets,
+    references_in,
+    substitute,
 )
 
 
@@ -68,3 +72,35 @@ def test_secret_names_are_restricted(tmp_path: Path) -> None:
     path = _write_secrets(tmp_path, {"has space": "x"})
     with pytest.raises(SecretsError, match="outside"):
         load_secrets(path)
+
+
+def test_substitution_replaces_references() -> None:
+    store = SecretStore(path=Path("s.json"), values={"pw": "hunter2", "host": "mail.example.net"})
+    result = substitute(text="${secret:pw}", store=store)
+    assert result.text == "hunter2"
+    assert result.missing == ()
+
+
+def test_substitution_works_inside_a_larger_string() -> None:
+    store = SecretStore(path=Path("s.json"), values={"user": "alice", "pw": "hunter2"})
+    result = substitute(text="imaps://${secret:user}:${secret:pw}@host", store=store)
+    assert result.text == "imaps://alice:hunter2@host"
+
+
+def test_missing_secrets_are_reported_and_left_in_place() -> None:
+    store = empty_store(Path("s.json"))
+    result = substitute(text="${secret:pw} and ${secret:pw}", store=store)
+    assert result.missing == ("pw",)
+    assert result.text == "${secret:pw} and ${secret:pw}"
+
+
+def test_strings_without_references_are_untouched() -> None:
+    store = empty_store(Path("s.json"))
+    result = substitute(text="plain text $ {secret:pw} ${notasecret}", store=store)
+    assert result.text == "plain text $ {secret:pw} ${notasecret}"
+    assert result.missing == ()
+
+
+def test_references_in_lists_names_once_in_order() -> None:
+    assert references_in("${secret:b} ${secret:a} ${secret:b}") == ["b", "a"]
+    assert references_in("nothing here") == []

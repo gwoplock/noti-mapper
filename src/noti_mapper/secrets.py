@@ -21,6 +21,7 @@ DEFAULT_SECRETS_PATH: Path = Path("/etc/noti-mapper/secrets.json")
 # Secret names are not object names -- they never appear in the rule graph --
 # so they have their own, narrower character set.
 SECRET_NAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
+SECRET_REFERENCE_PATTERN = re.compile(r"\$\{secret:([A-Za-z0-9_.-]+)\}")
 
 
 class SecretsError(Exception):
@@ -83,3 +84,43 @@ def load_secrets(path: Path) -> SecretStore:
         values[name] = node.value
 
     return SecretStore(path=path, values=values)
+
+
+@dataclass(frozen=True)
+class Substitution:
+    """The result of expanding secret references in one string."""
+
+    text: str
+    missing: tuple[str, ...]
+
+
+def substitute(*, text: str, store: SecretStore) -> Substitution:
+    """Expand every ``${secret:name}`` reference in ``text``.
+
+    References to secrets that are not in the store are left in place and
+    reported in ``missing``; the caller turns those into config errors, since a
+    missing secret is a validation failure rather than a runtime one.
+    """
+    missing: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        value = store.get(name)
+        if value is None:
+            if name not in missing:
+                missing.append(name)
+            return match.group(0)
+        return value
+
+    expanded = SECRET_REFERENCE_PATTERN.sub(replace, text)
+    return Substitution(text=expanded, missing=tuple(missing))
+
+
+def references_in(text: str) -> list[str]:
+    """Return the secret names referenced by a string, in order of appearance."""
+    found: list[str] = []
+    for match in SECRET_REFERENCE_PATTERN.finditer(text):
+        name = match.group(1)
+        if name not in found:
+            found.append(name)
+    return found
