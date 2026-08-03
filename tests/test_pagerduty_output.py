@@ -235,6 +235,18 @@ def test_the_events_api_is_not_sent_the_rest_token(harness: Harness) -> None:
     assert "Authorization" not in harness.stub.state.event_headers[0]
 
 
+def test_the_poller_requests_an_unlatch_when_the_incident_resolves(harness: Harness) -> None:
+    harness.stub.state.incidents = [{"status": "resolved", "resolved_at": "2026-03-01T14:30:00Z"}]
+    harness.plugin.poll_once()
+    assert harness.unlatches == ["PagerDuty incident resolved"]
+
+
+def test_the_poller_stays_quiet_while_the_incident_is_open(harness: Harness) -> None:
+    harness.stub.state.incidents = [{"status": "triggered"}]
+    harness.plugin.poll_once()
+    assert harness.unlatches == []
+
+
 # -- settings -----------------------------------------------------------------
 
 
