@@ -50,6 +50,10 @@ PLUGIN_NAME = "imap-input"
 UIDVALIDITY_KEY = "uidvalidity"
 LAST_UID_KEY = "last_uid"
 
+# imapclient's idle_check takes a timeout; a short one keeps stop() responsive
+# without re-issuing IDLE more often than the server needs.
+IDLE_CHECK_SECONDS = 30
+
 
 class ImapInput(InputPlugin):
     """Watches one mailbox on one account."""
@@ -67,12 +71,84 @@ class ImapInput(InputPlugin):
         self._status = HealthStatus.STARTING
         self._detail = "not yet connected"
 
+    # -- lifecycle ------------------------------------------------------------
+
+    def start(self) -> None:
+        """Connect and watch until stopped, reconnecting with backoff."""
+        delay = self._settings.reconnect_initial_seconds
+        while not self._stop.is_set():
+            try:
+                self._watch_once()
+                delay = self._settings.reconnect_initial_seconds
+            except Exception as error:
+                if self._stop.is_set():
+                    return
+                self._set_health(HealthStatus.FAILED, f"{type(error).__name__}: {error}")
+                self._log.warning(
+                    "IMAP connection to %s failed, retrying in %.0fs: %s",
+                    self._settings.host,
+                    delay,
+                    error,
+                    extra={"instance": self.context.instance_name, "host": self._settings.host},
+                )
+                if self._stop.wait(timeout=delay):
+                    return
+                delay = min(delay * 2, self._settings.reconnect_max_seconds)
+
     def stop(self) -> None:
         self._stop.set()
 
     def health(self) -> PluginHealth:
         with self._state_lock:
             return PluginHealth(status=self._status, detail=self._detail)
+
+    # -- downtime recovery ----------------------------------------------------
+
+    def catch_up(self, since: datetime.datetime | None) -> list[ObservedEvent]:
+        """Return matching messages that arrived while the daemon was stopped.
+
+        ``since`` is not used to select messages: the persisted UID cursor is
+        both more precise and immune to clock skew between here and the mail
+        server. The message date is still what ends up on the event, because
+        that is the timestamp reconciliation compares against an output's clear
+        time.
+        """
+        del since
+
+        client = self._connect()
+        try:
+            self._select(client)
+            uids = self._new_uids(client)
+            if not uids:
+                return []
+            if len(uids) > self._settings.catch_up_limit:
+                self._log.warning(
+                    "%d messages arrived during downtime; only the newest %d are examined",
+                    len(uids),
+                    self._settings.catch_up_limit,
+                    extra={"instance": self.context.instance_name},
+                )
+                uids = uids[-self._settings.catch_up_limit :]
+
+            events = self._evaluate(client=client, uids=uids, emit_now=False)
+            self._advance_cursor(max(uids))
+            return events
+        finally:
+            _close_quietly(client)
+
+    # -- the watch loop -------------------------------------------------------
+
+    def _watch_once(self) -> None:
+        client = self._connect()
+        try:
+            self._select(client)
+            self._process_new(client)
+            if self._supports_idle(client):
+                self._idle_loop(client)
+            else:
+                self._poll_loop(client)
+        finally:
+            _close_quietly(client)
 
     def _connect(self) -> Any:
         client = imapclient.IMAPClient(
@@ -93,6 +169,49 @@ class ImapInput(InputPlugin):
         self._set_health(
             HealthStatus.OK, f"watching {self._settings.folder} on {self._settings.host}"
         )
+
+    def _supports_idle(self, client: Any) -> bool:
+        if client.has_capability("IDLE"):
+            return True
+        self._log.info(
+            "%s does not advertise IDLE; polling every %ds instead",
+            self._settings.host,
+            self._settings.poll_seconds,
+            extra={"instance": self.context.instance_name},
+        )
+        self._set_health(HealthStatus.DEGRADED, "server does not support IDLE; polling")
+        return False
+
+    def _idle_loop(self, client: Any) -> None:
+        deadline = self.context.clock.monotonic() + self._settings.idle_refresh_seconds
+        client.idle()
+        try:
+            while not self._stop.is_set():
+                responses = client.idle_check(timeout=IDLE_CHECK_SECONDS)
+                if responses:
+                    client.idle_done()
+                    self._process_new(client)
+                    client.idle()
+                    deadline = self.context.clock.monotonic() + self._settings.idle_refresh_seconds
+                    continue
+                if self.context.clock.monotonic() >= deadline:
+                    # Re-issue IDLE before the server or an intermediate NAT
+                    # decides the connection is idle enough to drop.
+                    return
+        finally:
+            _idle_done_quietly(client)
+
+    def _poll_loop(self, client: Any) -> None:
+        while not self._stop.wait(timeout=self._settings.poll_seconds):
+            client.noop()
+            self._process_new(client)
+
+    def _process_new(self, client: Any) -> None:
+        uids = self._new_uids(client)
+        if not uids:
+            return
+        self._evaluate(client=client, uids=uids, emit_now=True)
+        self._advance_cursor(max(uids))
 
     # -- messages -------------------------------------------------------------
 
@@ -283,3 +402,15 @@ def _close_quietly(client: Any) -> None:
     except Exception:
         with contextlib.suppress(Exception):
             client.shutdown()
+
+
+def _idle_done_quietly(client: Any) -> None:
+    with contextlib.suppress(Exception):
+        client.idle_done()
+
+
+# catch_up() lets imapclient's own exceptions propagate rather than wrapping
+# them in PluginError. The core treats both identically: it logs the failure,
+# falls back to persisted state rather than blocking startup, and retries in
+# the background.
+INPUT_PLUGIN = ImapInput
