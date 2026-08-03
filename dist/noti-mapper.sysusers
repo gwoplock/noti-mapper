@@ -1,0 +1,4 @@
+# A dedicated system user. Not DynamicUser: the daemon owns persistent state
+# under /var/lib/noti-mapper and the secrets file under /etc/noti-mapper must
+# be readable by a stable, nameable user.
+u noti-mapper - "noti-mapper notification latch" /var/lib/noti-mapper /usr/bin/nologin
