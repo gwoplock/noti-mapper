@@ -252,3 +252,64 @@ def test_the_example_secrets_file_is_not_shipped_world_readable_by_accident() ->
     mode = stat.S_IMODE((EXAMPLES / "secrets.json").stat().st_mode)
     assert mode & 0o111 == 0, "a JSON template should not be executable"
     assert "0600" in (EXAMPLES / "README.md").read_text(encoding="utf-8")
+
+
+# -- the prose docs -----------------------------------------------------------
+
+DOCS = REPOSITORY_ROOT / "docs"
+
+
+def test_the_rename_warning_follows_the_first_mention_of_rule_names() -> None:
+    """A requirement, not a preference: it has to be where a user will hit it."""
+    page = (DOCS / "configuration.md").read_text(encoding="utf-8")
+
+    rules_heading = page.index("\n## Rules")
+    warning = page.index("Renaming a rule is not free")
+    next_heading = page.index("\n## Rule semantics")
+
+    assert rules_heading < warning < next_heading
+
+
+def test_the_configuration_reference_covers_every_shipped_plugin() -> None:
+    page = (DOCS / "configuration.md").read_text(encoding="utf-8")
+    for plugin in (
+        "imap-input",
+        "webhook-input",
+        "file-input",
+        "homekit-output",
+        "pagerduty-output",
+    ):
+        assert f"`{plugin}`" in page
+
+
+def test_the_configuration_reference_states_the_secrets_design_goal() -> None:
+    assert "safe to paste into a GitHub issue" in _unwrapped(DOCS / "configuration.md")
+
+
+def test_the_docs_are_honest_about_exposing_the_webhook() -> None:
+    page = _unwrapped(DOCS / "configuration.md")
+    assert "your decision and your responsibility" in page
+
+
+def _unwrapped(path: Path) -> str:
+    """Collapse the prose wrapping so a phrase can be searched for as written."""
+    return " ".join(path.read_text(encoding="utf-8").split())
+
+
+def test_the_readme_corrects_the_homekit_misconception() -> None:
+    readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "existing" in readme
+    assert "re-pairing" in readme or "re-pair" in readme
+
+
+def test_the_authoring_guide_covers_the_reverse_channel() -> None:
+    guide = (DOCS / "plugin-authoring.md").read_text(encoding="utf-8")
+    for topic in ("request_unlatch", "catch_up", "RemoteBelief.UNKNOWN", "idempotent"):
+        assert topic in guide
+
+
+def test_the_non_goals_are_written_down_where_people_will_look() -> None:
+    readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "Non-goals" in readme
+    for goal in ("web UI", "auto-clearing", "schedules"):
+        assert goal in readme
