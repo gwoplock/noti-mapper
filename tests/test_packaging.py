@@ -5,14 +5,18 @@ subcommand that was renamed, or a man page promising a default the code no
 longer has are all things a user hits before any maintainer does.
 """
 
+import json
 import re
+import shutil
+import stat
 import sys
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from noti_mapper.cli import SUBCOMMANDS, build_parser, subcommand_names
+from noti_mapper.cli import EXIT_OK, SUBCOMMANDS, build_parser, main, subcommand_names
+from noti_mapper.discovery import source_checkout_plugin_directory
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DIST = REPOSITORY_ROOT / "dist"
@@ -29,6 +33,61 @@ def clean_module_table() -> Iterator[None]:
     for name in set(sys.modules) - before:
         if name.startswith("noti_mapper_plugin_"):
             del sys.modules[name]
+
+
+# -- the example configuration ------------------------------------------------
+
+
+def test_the_shipped_examples_validate(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config = tmp_path / "conf.d"
+    config.mkdir()
+    for name in ("10-instances.json", "20-rules.json"):
+        shutil.copy(EXAMPLES / name, config / name)
+
+    secrets = tmp_path / "secrets.json"
+    shutil.copy(EXAMPLES / "secrets.json", secrets)
+    secrets.chmod(0o600)
+
+    plugins = source_checkout_plugin_directory()
+    assert plugins is not None
+
+    status = main(
+        [
+            "--config-dir",
+            str(config),
+            "--secrets",
+            str(secrets),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--plugin-dir",
+            str(plugins),
+            "validate",
+        ]
+    )
+    assert status == EXIT_OK, capsys.readouterr().err
+
+
+def test_every_secret_the_examples_reference_is_in_the_example_secrets_file() -> None:
+    referenced: set[str] = set()
+    for name in ("10-instances.json", "20-rules.json"):
+        text = (EXAMPLES / name).read_text(encoding="utf-8")
+        referenced.update(re.findall(r"\$\{secret:([A-Za-z0-9_.-]+)\}", text))
+
+    provided = set(json.loads((EXAMPLES / "secrets.json").read_text(encoding="utf-8")))
+    assert referenced == provided
+
+
+def test_the_example_imap_reader_ships_in_dry_run() -> None:
+    """Arming a mail watcher on first boot is not a sensible default."""
+    document = json.loads((EXAMPLES / "10-instances.json").read_text(encoding="utf-8"))
+    reader = document["instances"]["Porch Mail"]
+    assert reader["plugin"] == "imap-input"
+    assert reader["config"]["dry_run"] is True
+
+
+def test_the_examples_are_valid_json_with_no_duplicate_keys() -> None:
+    for path in sorted(EXAMPLES.glob("*.json")):
+        json.loads(path.read_text(encoding="utf-8"))
 
 
 # -- the systemd unit ---------------------------------------------------------
@@ -107,3 +166,10 @@ def test_the_sysusers_home_matches_the_state_directory() -> None:
     entry = re.search(r"^u\s+\S+\s+\S+\s+\"[^\"]*\"\s+(\S+)", SYSUSERS.read_text(), re.MULTILINE)
     assert entry is not None
     assert entry.group(1) == "/var/lib/noti-mapper"
+
+
+def test_the_example_secrets_file_is_not_shipped_world_readable_by_accident() -> None:
+    """The file in the repository is a template; the docs say to install it 0600."""
+    mode = stat.S_IMODE((EXAMPLES / "secrets.json").stat().st_mode)
+    assert mode & 0o111 == 0, "a JSON template should not be executable"
+    assert "0600" in (EXAMPLES / "README.md").read_text(encoding="utf-8")

@@ -1,0 +1,8 @@
+{
+  "rules": {
+    "Package On Porch": {
+      "inputs": ["Porch Mail"],
+      "outputs": ["Porch Lamp", "Porch Pager"]
+    }
+  }
+}
