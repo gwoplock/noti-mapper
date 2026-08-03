@@ -28,12 +28,14 @@ from noti_mapper import VERSION
 from noti_mapper.clock import SystemClock
 from noti_mapper.config import (
     DEFAULT_CONFIG_DIRECTORY,
+    ConfigurationError,
+    load_configuration,
 )
-from noti_mapper.discovery import default_search_path
+from noti_mapper.discovery import default_search_path, discover, known_plugins
 from noti_mapper.logging_setup import configure as configure_logging
 from noti_mapper.logging_setup import level_from_name
 from noti_mapper.runtime import Daemon, Paths, StartupError
-from noti_mapper.secrets import DEFAULT_SECRETS_PATH
+from noti_mapper.secrets import DEFAULT_SECRETS_PATH, SecretsError, load_secrets
 from noti_mapper.storage import (
     DEFAULT_STATE_DIRECTORY,
     StorageError,
@@ -184,4 +186,36 @@ def _run(paths: Paths) -> int:
         daemon.run()
     finally:
         daemon.stop()
+    return EXIT_OK
+
+
+# -- validate -----------------------------------------------------------------
+
+
+def _validate(paths: Paths) -> int:
+    discovery = discover(search_path=list(paths.plugin_directories), logger=logging.getLogger())
+    for failure in discovery.failures:
+        print(f"warning: plugin at {failure.directory}: {failure.message}", file=sys.stderr)
+
+    try:
+        secrets = load_secrets(paths.secrets_path)
+    except SecretsError as error:
+        print(f"noti-mapper: {error}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+
+    try:
+        configuration = load_configuration(
+            config_directory=paths.config_directory,
+            secrets=secrets,
+            known_plugins=known_plugins(discovery),
+        )
+    except ConfigurationError as error:
+        print(f"noti-mapper: {error}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+
+    print(
+        f"configuration is valid: {len(configuration.instances)} instances, "
+        f"{len(configuration.rules)} rules, from "
+        f"{len(configuration.files)} file(s)"
+    )
     return EXIT_OK
