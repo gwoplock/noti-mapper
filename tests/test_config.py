@@ -586,3 +586,73 @@ def test_plugin_settings_validation_sees_resolved_secrets(tmp_path: Path) -> Non
     store = SecretStore(path=Path("s.json"), values={"pw": "hunter2"})
     _load(tmp_path, secrets=store, known=known)
     assert seen == [{"password": "hunter2"}]
+
+
+# -- daemon-wide settings -----------------------------------------------------
+
+
+def test_daemon_settings_default_when_absent(tmp_path: Path) -> None:
+    _write(tmp_path, "a.json", {"instances": {"A": {"plugin": "imap-input"}}})
+    configuration = _load(tmp_path)
+    assert configuration.daemon.event_log_max_rows == 10_000
+    assert configuration.daemon.dispatcher_threads == 4
+    assert configuration.daemon.retry_initial_seconds == 5.0
+    assert configuration.daemon.retry_max_seconds == 900.0
+
+
+def test_daemon_settings_are_read(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "daemon": {
+                "event_log_max_rows": 500,
+                "dispatcher_threads": 2,
+                "retry_initial_seconds": 1,
+                "retry_max_seconds": 60.5,
+            },
+            "instances": {"A": {"plugin": "imap-input"}},
+        },
+    )
+    daemon = _load(tmp_path).daemon
+    assert daemon.event_log_max_rows == 500
+    assert daemon.dispatcher_threads == 2
+    assert daemon.retry_initial_seconds == 1.0
+    assert daemon.retry_max_seconds == 60.5
+
+
+def test_a_second_daemon_block_is_an_error(tmp_path: Path) -> None:
+    _write(tmp_path, "10-a.json", {"daemon": {"dispatcher_threads": 2}})
+    _write(tmp_path, "20-b.json", {"daemon": {"dispatcher_threads": 3}})
+    errors = _errors(tmp_path)
+    assert any('a second "daemon" block' in error for error in errors)
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True, "4", None])
+def test_daemon_integers_must_be_positive_integers(tmp_path: Path, value: object) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {"daemon": {"dispatcher_threads": value}, "instances": {"A": {"plugin": "imap-input"}}},
+    )
+    errors = _errors(tmp_path)
+    assert any("must be a positive integer" in error for error in errors)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "4", None])
+def test_daemon_numbers_must_be_positive(tmp_path: Path, value: object) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {"daemon": {"retry_max_seconds": value}, "instances": {"A": {"plugin": "imap-input"}}},
+    )
+    errors = _errors(tmp_path)
+    assert any("must be a positive number" in error for error in errors)
+
+
+def test_unknown_daemon_key_is_an_error(tmp_path: Path) -> None:
+    _write(
+        tmp_path, "a.json", {"daemon": {"threads": 2}, "instances": {"A": {"plugin": "imap-input"}}}
+    )
+    errors = _errors(tmp_path)
+    assert any("unknown key 'threads'" in error for error in errors)

@@ -33,9 +33,15 @@ from noti_mapper.secrets import SecretStore, substitute
 
 DEFAULT_CONFIG_DIRECTORY: Path = Path("/etc/noti-mapper.d")
 
-_TOP_LEVEL_KEYS = ("instances", "rules")
+_TOP_LEVEL_KEYS = ("daemon", "instances", "rules")
 _INSTANCE_KEYS = ("plugin", "config", "enabled")
 _RULE_KEYS = ("inputs", "outputs", "enabled")
+_DAEMON_KEYS = (
+    "event_log_max_rows",
+    "dispatcher_threads",
+    "retry_initial_seconds",
+    "retry_max_seconds",
+)
 
 
 class PluginDirection(enum.Enum):
@@ -90,12 +96,29 @@ class RuleConfig:
 
 
 @dataclass(frozen=True)
+class DaemonSettings:
+    """Daemon-wide knobs, from the optional top-level ``daemon`` object.
+
+    Every one of these has a defensible default; the block exists so that an
+    installation with unusual needs does not have to patch the source.
+    """
+
+    # event_log is a log, not an audit trail: it rolls, oldest rows first. No
+    # code path may depend on it being complete.
+    event_log_max_rows: int = 10_000
+    dispatcher_threads: int = 4
+    retry_initial_seconds: float = 5.0
+    retry_max_seconds: float = 900.0
+
+
+@dataclass(frozen=True)
 class Configuration:
     """Everything the daemon needs from ``/etc/noti-mapper.d/``."""
 
     instances: Mapping[str, InstanceConfig]
     rules: Mapping[str, RuleConfig]
     files: tuple[Path, ...]
+    daemon: DaemonSettings = DaemonSettings()
 
     def enabled_instances(self) -> list[InstanceConfig]:
         result: list[InstanceConfig] = []
@@ -203,6 +226,7 @@ class _Loader:
         # one of these should not also be told the instance does not exist --
         # that turns one mistake into two errors and hides the real one.
         self._broken_instances: set[str] = set()
+        self._daemon_node: JsonObject | None = None
 
     def load(self) -> Configuration:
         files = self._read_files()
@@ -211,13 +235,14 @@ class _Loader:
             if document is not None:
                 self._collect_document(document=document)
 
+        daemon = self._build_daemon()
         instances = self._build_instances()
         rules = self._build_rules(instances)
 
         if self._errors:
             raise ConfigurationError(self._errors)
 
-        return Configuration(instances=instances, rules=rules, files=tuple(files))
+        return Configuration(instances=instances, rules=rules, files=tuple(files), daemon=daemon)
 
     # -- file handling --------------------------------------------------------
 
@@ -248,7 +273,7 @@ class _Loader:
             self._errors.append(
                 ConfigError(
                     "the top level of a configuration file must be an object with "
-                    '"instances" and/or "rules" keys',
+                    '"instances", "rules", and/or "daemon" keys',
                     document.location,
                 )
             )
@@ -268,14 +293,75 @@ class _Loader:
                 )
                 continue
             if not isinstance(node, JsonObject):
-                self._errors.append(
-                    ConfigError(f"{key!r} must be an object keyed by name", node.location)
-                )
+                self._errors.append(ConfigError(f"{key!r} must be an object", node.location))
                 continue
-            if key == "instances":
+            if key == "daemon":
+                self._collect_daemon(node=node, location=location)
+            elif key == "instances":
                 self._collect_named(container=node, namespace=Namespace.INSTANCE)
             else:
                 self._collect_named(container=node, namespace=Namespace.RULE)
+
+    def _collect_daemon(self, *, node: JsonObject, location: Location) -> None:
+        if self._daemon_node is not None:
+            self._errors.append(
+                ConfigError(
+                    'a second "daemon" block; it is already defined at '
+                    f"{self._daemon_node.location}. Daemon-wide settings live in "
+                    "exactly one file.",
+                    location,
+                )
+            )
+            return
+        self._daemon_node = node
+
+    # -- daemon-wide settings -------------------------------------------------
+
+    def _build_daemon(self) -> DaemonSettings:
+        node = self._daemon_node
+        if node is None:
+            return DaemonSettings()
+
+        self._reject_unknown_keys(node=node, allowed=_DAEMON_KEYS, subject='"daemon"')
+        defaults = DaemonSettings()
+        return DaemonSettings(
+            event_log_max_rows=self._positive_int(
+                node=node, key="event_log_max_rows", default=defaults.event_log_max_rows
+            ),
+            dispatcher_threads=self._positive_int(
+                node=node, key="dispatcher_threads", default=defaults.dispatcher_threads
+            ),
+            retry_initial_seconds=self._positive_number(
+                node=node, key="retry_initial_seconds", default=defaults.retry_initial_seconds
+            ),
+            retry_max_seconds=self._positive_number(
+                node=node, key="retry_max_seconds", default=defaults.retry_max_seconds
+            ),
+        )
+
+    def _positive_int(self, *, node: JsonObject, key: str, default: int) -> int:
+        member = node.members.get(key)
+        if member is None:
+            return default
+        value = member.value if isinstance(member, JsonScalar) else None
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            self._errors.append(
+                ConfigError(f'"daemon": "{key}" must be a positive integer', member.location)
+            )
+            return default
+        return value
+
+    def _positive_number(self, *, node: JsonObject, key: str, default: float) -> float:
+        member = node.members.get(key)
+        if member is None:
+            return default
+        value = member.value if isinstance(member, JsonScalar) else None
+        if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+            self._errors.append(
+                ConfigError(f'"daemon": "{key}" must be a positive number', member.location)
+            )
+            return default
+        return float(value)
 
     def _collect_named(self, *, container: JsonObject, namespace: Namespace) -> None:
         for raw_name, node in container.members.items():
