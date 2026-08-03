@@ -279,6 +279,51 @@ def test_writing_a_latch_for_an_unknown_rule_is_refused(store: Store) -> None:
         )
 
 
+# -- rename -------------------------------------------------------------------
+
+
+def test_rename_migrates_the_latch_and_the_edges(store: Store) -> None:
+    store.sync_rules([_rule("Package On Porch", ("Mail",), ("Lamp",))])
+    store.write_latch(
+        LatchRecord(
+            rule_name="Package On Porch",
+            state=True,
+            set_at=MOMENT,
+            cleared_at=None,
+            trigger_count=9,
+            last_cause="Mail",
+        )
+    )
+
+    store.rename_rule(old_name="Package On Porch", new_name="Porch Package")
+
+    assert store.latch("Package On Porch") is None
+    latch = store.latch("Porch Package")
+    assert latch is not None
+    assert latch.state is True
+    assert latch.trigger_count == 9
+
+    rules = store.rules()
+    assert [rule.name for rule in rules] == ["Porch Package"]
+    assert rules[0].inputs == ("Mail",)
+    assert rules[0].outputs == ("Lamp",)
+
+
+def test_rename_clears_the_orphaned_flag(store: Store) -> None:
+    store.sync_rules([_rule("Old", ("A",), ("B",))])
+    store.sync_rules([])
+    store.rename_rule(old_name="Old", new_name="New")
+    assert store.rules()[0].orphaned is False
+
+
+def test_rename_refuses_unknown_and_colliding_names(store: Store) -> None:
+    store.sync_rules([_rule("A", ("i",), ("o",)), _rule("B", ("i",), ("o",))])
+    with pytest.raises(StorageError, match="no rule named"):
+        store.rename_rule(old_name="Nope", new_name="X")
+    with pytest.raises(StorageError, match="already exists"):
+        store.rename_rule(old_name="A", new_name="B")
+
+
 # -- plugin key/value ---------------------------------------------------------
 
 

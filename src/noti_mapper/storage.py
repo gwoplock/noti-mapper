@@ -554,6 +554,44 @@ class Store:
             ),
         )
 
+    def rename_rule(self, *, old_name: str, new_name: str) -> None:
+        """Migrate a rule and its latch to a new name.
+
+        Renaming a rule in configuration is otherwise indistinguishable from
+        deleting one rule and creating another: the old latch orphans and the
+        new rule starts cleared. This is what makes a rename not lose state.
+        """
+        with self._database.transaction() as transaction:
+            existing = transaction.execute(
+                "SELECT enabled FROM rules WHERE name = ?", (old_name,)
+            ).fetchone()
+            if existing is None:
+                raise StorageError(f"no rule named {old_name!r} in {self._database.path}")
+            clash = transaction.execute(
+                "SELECT name FROM rules WHERE name = ?", (new_name,)
+            ).fetchone()
+            if clash is not None:
+                raise StorageError(f"a rule named {new_name!r} already exists")
+
+            # Insert the new parent row first, move every child onto it, then
+            # drop the old parent. Renaming the parent in place would leave the
+            # children pointing at a name that no longer exists for the length
+            # of one statement, which the foreign keys correctly refuse.
+            transaction.execute(
+                "INSERT INTO rules (name, enabled, orphaned) VALUES (?, ?, 0)",
+                (new_name, int(bool(existing["enabled"]))),
+            )
+            transaction.execute(
+                "UPDATE latches SET rule_name = ? WHERE rule_name = ?", (new_name, old_name)
+            )
+            transaction.execute(
+                "UPDATE rule_inputs SET rule_name = ? WHERE rule_name = ?", (new_name, old_name)
+            )
+            transaction.execute(
+                "UPDATE rule_outputs SET rule_name = ? WHERE rule_name = ?", (new_name, old_name)
+            )
+            transaction.execute("DELETE FROM rules WHERE name = ?", (old_name,))
+
 
 class PluginKeyValueStore:
     """Durable per-instance scratch storage for plugins.
