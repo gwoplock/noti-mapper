@@ -1,4 +1,5 @@
 import datetime
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from noti_mapper.storage import (
     SCHEMA_VERSION,
     Database,
     StorageError,
+    Store,
     database_path,
     initialize,
 )
@@ -23,6 +25,12 @@ def database(tmp_path: Path) -> Iterator[Database]:
         yield opened
     finally:
         opened.close()
+
+
+@pytest.fixture
+def store(database: Database) -> Store:
+    initialize(database)
+    return Store(database=database)
 
 
 # -- schema -------------------------------------------------------------------
@@ -49,6 +57,29 @@ def test_an_unknown_schema_version_is_refused(database: Database) -> None:
     database.connection().execute("UPDATE schema_version SET version = 99")
     with pytest.raises(StorageError, match="schema version 99"):
         initialize(database)
+
+
+def test_a_failed_transaction_rolls_back(store: Store) -> None:
+    with pytest.raises(RuntimeError), store.database.transaction() as transaction:
+        transaction.execute("INSERT INTO instances (name, plugin, enabled) VALUES ('A', 'p', 1)")
+        raise RuntimeError("boom")
+    assert store.instances() == []
+
+
+def test_each_thread_gets_its_own_connection(store: Store) -> None:
+    seen: list[int] = []
+
+    def record() -> None:
+        seen.append(id(store.database.connection()))
+        store.database.close()
+
+    main = id(store.database.connection())
+    thread = threading.Thread(target=record, name="storage-test")
+    thread.start()
+    thread.join()
+
+    assert len(seen) == 1
+    assert seen[0] != main
 
 
 # -- timestamps ---------------------------------------------------------------

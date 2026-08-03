@@ -221,3 +221,34 @@ def initialize(database: Database) -> None:
 
 class StorageError(Exception):
     """The database cannot be used."""
+
+
+class Store:
+    """Typed access to the daemon's persistent state.
+
+    Every method is a small operation with an explicit signature. Callers never
+    see SQL and never see a bare row.
+    """
+
+    def __init__(self, *, database: Database) -> None:
+        self._database = database
+
+    @property
+    def database(self) -> Database:
+        return self._database
+
+    def instances(self, *, include_orphaned: bool = True) -> list[InstanceRecord]:
+        connection = self._database.connection()
+        clause = "" if include_orphaned else " WHERE orphaned = 0"
+        rows = connection.execute(f"SELECT * FROM instances{clause} ORDER BY name").fetchall()
+        records: list[InstanceRecord] = []
+        for row in rows:
+            records.append(
+                InstanceRecord(
+                    name=str(row["name"]),
+                    plugin=str(row["plugin"]),
+                    enabled=_as_bool(row["enabled"]),
+                    orphaned=_as_bool(row["orphaned"]),
+                )
+            )
+        return records
