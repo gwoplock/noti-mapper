@@ -115,6 +115,61 @@ class WebhookInput(InputPlugin):
         self._accepted = 0
         self._rejected = 0
 
+    # -- lifecycle ------------------------------------------------------------
+
+    def start(self) -> None:
+        handler = _make_handler(self)
+        try:
+            server = http.server.ThreadingHTTPServer((self._bind, self._port), handler)
+        except OSError as error:
+            self._set_health(HealthStatus.FAILED, f"cannot listen on {self._address()}: {error}")
+            self._log.error(
+                "webhook receiver cannot listen on %s: %s",
+                self._address(),
+                error,
+                extra={"instance": self.context.instance_name},
+            )
+            return
+
+        self._server = server
+        self._bound_port = int(server.server_address[1])
+        self._listening.set()
+        self._set_health(HealthStatus.OK, f"listening on {self._address()}{self._path}")
+        self._log.info(
+            "webhook receiver listening on http://%s%s",
+            self._address(),
+            self._path,
+            extra={"instance": self.context.instance_name},
+        )
+        if self._bind not in {"127.0.0.1", "::1", "localhost"}:
+            self._log.warning(
+                "webhook receiver is bound to %s, which is not loopback. Exposing "
+                "this endpoint beyond the local machine is your decision and your "
+                "responsibility.",
+                self._bind,
+                extra={"instance": self.context.instance_name},
+            )
+
+        try:
+            server.serve_forever(poll_interval=0.2)
+        finally:
+            server.server_close()
+            self._listening.clear()
+            self._set_health(HealthStatus.STOPPED, "not listening")
+
+    def stop(self) -> None:
+        self._stop.set()
+        server = self._server
+        if server is not None:
+            server.shutdown()
+
+    def health(self) -> PluginHealth:
+        with self._state_lock:
+            detail = self._detail
+            if self._status is HealthStatus.OK:
+                detail = f"{detail}; {self._accepted} accepted, {self._rejected} rejected"
+            return PluginHealth(status=self._status, detail=detail)
+
     def catch_up(self, since: datetime.datetime | None) -> list[ObservedEvent]:
         """Nothing to catch up on: a webhook that arrived while we were down is gone."""
         del since
@@ -170,6 +225,25 @@ class WebhookInput(InputPlugin):
             reason,
             extra={"instance": self.context.instance_name, "source": source},
         )
+
+    @property
+    def bound_port(self) -> int | None:
+        """The port actually being served, which differs from ``port`` when 0 was asked for."""
+        return self._bound_port
+
+    def wait_until_listening(self, timeout: float) -> bool:
+        """Block until the socket is open. Returns False on timeout."""
+        return self._listening.wait(timeout=timeout)
+
+    def _address(self) -> str:
+        if self._bound_port is not None:
+            return f"{self._bind}:{self._bound_port}"
+        return f"{self._bind}:{self._port}"
+
+    def _set_health(self, status: HealthStatus, detail: str) -> None:
+        with self._state_lock:
+            self._status = status
+            self._detail = detail
 
 
 def _parse_json(body: bytes) -> dict[str, object] | None:
@@ -254,3 +328,6 @@ def _make_handler(plugin: WebhookInput) -> type[http.server.BaseHTTPRequestHandl
             plugin.context.logger.debug(format, *args)
 
     return Handler
+
+
+INPUT_PLUGIN = WebhookInput
