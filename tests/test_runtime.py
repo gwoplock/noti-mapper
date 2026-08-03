@@ -6,6 +6,7 @@ directories from disk, an input thread emits, the dispatcher pool pushes, and
 shutdown returns.
 """
 
+import datetime
 import json
 import sys
 import threading
@@ -161,6 +162,59 @@ def test_an_event_latches_and_drives_a_real_output(workspace: dict[str, Path]) -
         assert latch is not None
         assert latch.state is False
         assert latch.trigger_count == 1
+
+
+def test_state_survives_a_restart(workspace: dict[str, Path]) -> None:
+    _default_config(workspace)
+
+    with _daemon(workspace):
+        (workspace["signals"] / "trigger").write_text("first", encoding="utf-8")
+        _eventually(lambda: _lamp(workspace) == "true", what="the first latch")
+
+    (workspace["signals"] / "lamp").unlink()
+
+    with _daemon(workspace):
+        # Reconciliation forces the output back into agreement with the latch
+        # that survived the restart.
+        _eventually(lambda: _lamp(workspace) == "true", what="the latch to survive")
+
+
+def test_a_downtime_event_after_a_remote_clear_re_latches(workspace: dict[str, Path]) -> None:
+    _default_config(workspace)
+    signals = workspace["signals"]
+
+    with _daemon(workspace):
+        signals.joinpath("trigger").write_text("first", encoding="utf-8")
+        _eventually(lambda: _lamp(workspace) == "true", what="the first latch")
+
+    clear_time = datetime.datetime.now(tz=datetime.UTC) - datetime.timedelta(hours=2)
+    event_time = clear_time + datetime.timedelta(hours=1)
+    signals.joinpath("belief").write_text(f"cleared:{clear_time.isoformat()}", encoding="utf-8")
+    signals.joinpath("catch-up").write_text(event_time.isoformat(), encoding="utf-8")
+    signals.joinpath("lamp").unlink()
+
+    with _daemon(workspace):
+        _eventually(lambda: _lamp(workspace) == "true", what="the later event to win")
+
+    for store in _store(workspace):
+        latch = store.latch("Package On Porch")
+        assert latch is not None
+        assert latch.state is True
+        assert latch.set_at == event_time
+
+
+def test_a_remote_clear_with_no_later_event_clears(workspace: dict[str, Path]) -> None:
+    _default_config(workspace)
+    signals = workspace["signals"]
+
+    with _daemon(workspace):
+        signals.joinpath("trigger").write_text("first", encoding="utf-8")
+        _eventually(lambda: _lamp(workspace) == "true", what="the first latch")
+
+    signals.joinpath("belief").write_text("cleared", encoding="utf-8")
+
+    with _daemon(workspace):
+        _eventually(lambda: _lamp(workspace) == "false", what="the remote clear to win")
 
 
 def test_health_is_recorded_for_every_instance(workspace: dict[str, Path]) -> None:
