@@ -16,7 +16,7 @@ from noti_mapper.messages import (
     PushResultMessage,
     UnlatchRequestMessage,
 )
-from noti_mapper.plugin import ObservedEvent
+from noti_mapper.plugin import ObservedEvent, RemoteBelief, RemoteState
 from noti_mapper.rules import Rule, RuleGraph
 from noti_mapper.storage import (
     Database,
@@ -30,6 +30,7 @@ from noti_mapper.storage import (
 )
 from tests.support import (
     FakeInput,
+    FakeInputBehaviour,
     FakeOutput,
     FakeOutputBehaviour,
     InlineDispatcher,
@@ -467,6 +468,110 @@ def test_a_push_to_a_vanished_instance_is_dropped(simple: Harness) -> None:
     simple.engine.drain()
 
     assert simple.store.pending_push("Lamp") is None
+
+
+# -- reconciliation, end to end -----------------------------------------------
+
+
+def test_reconciliation_re_sets_after_a_clear_followed_by_an_event(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        harness.fire("Mail")
+        assert harness.latch("R") is True
+
+    clear_time = START + datetime.timedelta(hours=1)
+    event_time = START + datetime.timedelta(hours=2)
+    later = ManualClock(start=START + datetime.timedelta(hours=3))
+
+    for restarted in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}, clock=later):
+        restarted.outputs["Lamp"].configure(
+            FakeOutputBehaviour(
+                query_result=RemoteState(belief=RemoteBelief.CLEARED, cleared_at=clear_time)
+            )
+        )
+        restarted.inputs["Mail"].configure(
+            FakeInputBehaviour(
+                catch_up_events=[ObservedEvent(occurred_at=event_time, metadata={"n": "1"})]
+            )
+        )
+
+        restarted.engine.reconcile()
+        restarted.engine.drain()
+
+        assert restarted.latch("R") is True
+        record = restarted.store.latch("R")
+        assert record is not None
+        assert record.set_at == event_time
+        assert restarted.applied("Lamp") == [True]
+
+
+def test_reconciliation_clears_when_the_output_says_so(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        harness.fire("Mail")
+
+    later = ManualClock(start=START + datetime.timedelta(hours=3))
+    for restarted in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}, clock=later):
+        restarted.outputs["Lamp"].configure(
+            FakeOutputBehaviour(
+                query_result=RemoteState(
+                    belief=RemoteBelief.CLEARED,
+                    cleared_at=START + datetime.timedelta(hours=1),
+                )
+            )
+        )
+        restarted.engine.reconcile()
+        restarted.engine.drain()
+
+        assert restarted.latch("R") is False
+        assert restarted.applied("Lamp") == [False]
+
+
+def test_reconciliation_forces_every_output_into_agreement(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        harness.fire("Mail")
+        assert harness.applied("Lamp") == [True]
+
+    for restarted in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        # The daemon already believes Lamp is true; reconciliation pushes
+        # anyway, because the daemon's belief is exactly what a restart casts
+        # into doubt.
+        restarted.engine.reconcile()
+        restarted.engine.drain()
+        assert restarted.applied("Lamp") == [True]
+
+
+def test_an_unreachable_output_does_not_block_startup(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        harness.fire("Mail")
+
+    for restarted in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        restarted.outputs["Lamp"].configure(
+            FakeOutputBehaviour(query_raises=RuntimeError("connection refused"))
+        )
+        restarted.engine.reconcile()
+
+        assert restarted.engine.ready.is_set()
+        assert restarted.latch("R") is True
+
+
+def test_a_failing_catch_up_does_not_block_startup(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        harness.inputs["Mail"].configure(
+            FakeInputBehaviour(catch_up_raises=RuntimeError("IMAP unavailable"))
+        )
+        harness.engine.reconcile()
+        assert harness.engine.ready.is_set()
+        assert harness.latch("R") is False
+
+
+def test_catch_up_is_given_the_last_time_the_daemon_ran(tmp_path: Path) -> None:
+    for harness in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}):
+        harness.engine.reconcile()
+        assert harness.inputs["Mail"].catch_up_calls == [None]
+
+    later = ManualClock(start=START + datetime.timedelta(hours=5))
+    for restarted in _build(tmp_path, rules={"R": (["Mail"], ["Lamp"])}, clock=later):
+        restarted.engine.reconcile()
+        assert restarted.inputs["Mail"].catch_up_calls == [START]
 
 
 # -- health -------------------------------------------------------------------
