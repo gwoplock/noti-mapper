@@ -23,6 +23,8 @@ from noti_mapper.jsonloc import (
 from noti_mapper.names import (
     NameRegistry,
     Namespace,
+    find_name_problems,
+    normalize_name,
 )
 from noti_mapper.secrets import SecretStore
 
@@ -271,6 +273,43 @@ class _Loader:
                 self._collect_named(container=node, namespace=Namespace.INSTANCE)
             else:
                 self._collect_named(container=node, namespace=Namespace.RULE)
+
+    def _collect_named(self, *, container: JsonObject, namespace: Namespace) -> None:
+        for raw_name, node in container.members.items():
+            location = container.key_locations[raw_name]
+
+            problems = find_name_problems(raw_name)
+            if problems:
+                for problem in problems:
+                    self._errors.append(
+                        ConfigError(f"{namespace.value} name {raw_name!r}: {problem}", location)
+                    )
+                continue
+
+            name = normalize_name(raw_name)
+            conflict = self._registry.find_conflict(name=name, namespace=namespace)
+            if conflict is not None:
+                self._errors.append(
+                    ConfigError(
+                        f"duplicate {namespace.value} name {name!r}; already defined as "
+                        f"{conflict.name!r} at {conflict.origin}. Names are unique "
+                        "case-insensitively, and later files may not redefine them.",
+                        location,
+                    )
+                )
+                continue
+
+            if not isinstance(node, JsonObject):
+                self._errors.append(
+                    ConfigError(f"{namespace.value} {name!r} must be an object", node.location)
+                )
+                continue
+
+            self._registry.register(name=name, namespace=namespace, origin=str(location))
+            if namespace is Namespace.INSTANCE:
+                self._instance_drafts.append(_InstanceDraft(name=name, node=node, origin=location))
+            else:
+                self._rule_drafts.append(_RuleDraft(name=name, node=node, origin=location))
 
     # -- instances ------------------------------------------------------------
 
