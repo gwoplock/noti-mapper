@@ -290,3 +290,125 @@ def test_world_readable_secrets_refuse_to_start(workspace: dict[str, Path]) -> N
     with pytest.raises(StartupError, match="chmod 0600"):
         daemon.start()
     daemon.stop()
+
+
+# -- reload -------------------------------------------------------------------
+
+
+def test_reload_adopts_a_new_rule(workspace: dict[str, Path]) -> None:
+    _default_config(workspace)
+    signals = workspace["signals"]
+
+    with _daemon(workspace) as daemon:
+        _eventually(lambda: _lamp(workspace) == "false", what="the initial push")
+
+        _write_config(
+            workspace,
+            {
+                "instances": {
+                    "Porch Mail": {
+                        "plugin": "probe-input",
+                        "config": {"trigger_file": str(signals / "trigger")},
+                    },
+                    "Porch Lamp": {
+                        "plugin": "probe-output",
+                        "config": {
+                            "state_file": str(signals / "lamp"),
+                            "unlatch_file": str(signals / "unlatch"),
+                        },
+                    },
+                    "Hall Lamp": {
+                        "plugin": "probe-output",
+                        "config": {"state_file": str(signals / "hall")},
+                    },
+                },
+                "rules": {
+                    "Package On Porch": {
+                        "inputs": ["Porch Mail"],
+                        "outputs": ["Porch Lamp", "Hall Lamp"],
+                    }
+                },
+            },
+        )
+        daemon._reload()  # noqa: SLF001 - the SIGHUP path without the signal
+
+        _eventually(lambda: (signals / "hall").exists(), what="the new output to be pushed")
+        signals.joinpath("trigger").write_text("after reload", encoding="utf-8")
+        _eventually(
+            lambda: (signals / "hall").read_text(encoding="utf-8") == "true",
+            what="the new output to follow the latch",
+        )
+
+
+def test_reload_with_an_invalid_configuration_keeps_running(
+    workspace: dict[str, Path],
+) -> None:
+    _default_config(workspace)
+
+    with _daemon(workspace) as daemon:
+        _eventually(lambda: _lamp(workspace) == "false", what="the initial push")
+
+        _write_config(workspace, {"instances": {"Broken": {"plugin": "nope"}}}, name="20-bad.json")
+        daemon._reload()  # noqa: SLF001
+
+        workspace["signals"].joinpath("trigger").write_text("still alive", encoding="utf-8")
+        _eventually(lambda: _lamp(workspace) == "true", what="the daemon to keep working")
+
+
+def test_removing_a_rule_on_reload_orphans_it_and_drops_the_output(
+    workspace: dict[str, Path],
+) -> None:
+    _default_config(workspace)
+    signals = workspace["signals"]
+
+    with _daemon(workspace) as daemon:
+        signals.joinpath("trigger").write_text("latch me", encoding="utf-8")
+        _eventually(lambda: _lamp(workspace) == "true", what="the latch")
+
+        _write_config(
+            workspace,
+            {
+                "instances": {
+                    "Porch Mail": {
+                        "plugin": "probe-input",
+                        "config": {"trigger_file": str(signals / "trigger")},
+                    },
+                    "Porch Lamp": {
+                        "plugin": "probe-output",
+                        "config": {"state_file": str(signals / "lamp")},
+                    },
+                },
+                "rules": {},
+            },
+        )
+        daemon._reload()  # noqa: SLF001
+
+        _eventually(lambda: _lamp(workspace) == "false", what="the orphaned rule to drop")
+
+    for store in _store(workspace):
+        latch = store.latch("Package On Porch")
+        assert latch is not None
+        assert latch.state is True, "the orphaned latch is retained, not deleted"
+        assert [rule.orphaned for rule in store.rules()] == [True]
+
+
+# -- the watchdog -------------------------------------------------------------
+
+
+def test_the_watchdog_reports_a_stale_core_loop(workspace: dict[str, Path]) -> None:
+    _default_config(workspace)
+    daemon = Daemon(paths=_paths(workspace), notifier=Notifier(address=""), handle_signals=False)
+
+    now = datetime.datetime.now(tz=datetime.UTC)
+    assert daemon._unhealthy_reason(now) == "the core loop has not started"  # noqa: SLF001
+
+    with _daemon(workspace) as running:
+        _eventually(lambda: _lamp(workspace) == "false", what="the initial push")
+        assert (
+            running._unhealthy_reason(datetime.datetime.now(tz=datetime.UTC)) is None
+        )  # noqa: SLF001
+
+        far_future = datetime.datetime.now(tz=datetime.UTC) + datetime.timedelta(hours=1)
+        reason = running._unhealthy_reason(far_future)  # noqa: SLF001
+        assert reason is not None
+        assert "has not ticked" in reason
