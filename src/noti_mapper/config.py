@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from noti_mapper.jsonloc import (
+    JsonArray,
+    JsonNode,
     JsonObject,
     JsonParseError,
     JsonScalar,
@@ -27,7 +29,7 @@ from noti_mapper.names import (
     find_name_problems,
     normalize_name,
 )
-from noti_mapper.secrets import SecretStore
+from noti_mapper.secrets import SecretStore, substitute
 
 DEFAULT_CONFIG_DIRECTORY: Path = Path("/etc/noti-mapper.d")
 
@@ -387,6 +389,33 @@ class _Loader:
                 self._errors.append(ConfigError(f"instance {draft.name!r}: {problem}", location))
 
         return settings
+
+    def _resolve_secrets_object(self, node: JsonObject) -> dict[str, object]:
+        members: dict[str, object] = {}
+        for key, value in node.members.items():
+            members[key] = self._resolve_secrets(value)
+        return members
+
+    def _resolve_secrets(self, node: JsonNode) -> object:
+        if isinstance(node, JsonScalar):
+            if not isinstance(node.value, str):
+                return node.value
+            result = substitute(text=node.value, store=self._secrets)
+            for name in result.missing:
+                known = ", ".join(self._secrets.names()) or "(none defined)"
+                self._errors.append(
+                    ConfigError(
+                        f"undefined secret {name!r}; {self._secrets.path} defines: {known}",
+                        node.location,
+                    )
+                )
+            return result.text
+        if isinstance(node, JsonArray):
+            elements: list[object] = []
+            for element in node.elements:
+                elements.append(self._resolve_secrets(element))
+            return elements
+        return self._resolve_secrets_object(node)
 
     # -- rules ----------------------------------------------------------------
 

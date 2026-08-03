@@ -168,3 +168,99 @@ def test_enabled_must_be_a_boolean(tmp_path: Path) -> None:
     _write(tmp_path, "a.json", {"instances": {"A": {"plugin": "imap-input", "enabled": "yes"}}})
     errors = _errors(tmp_path)
     assert "must be true or false" in errors[0]
+
+
+# -- secrets ------------------------------------------------------------------
+
+
+def test_secret_references_are_resolved_in_nested_config(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "instances": {
+                "Mail": {
+                    "plugin": "imap-input",
+                    "config": {
+                        "password": "${secret:pw}",
+                        "nested": {"token": "${secret:tok}"},
+                        "list": ["${secret:pw}", 5],
+                    },
+                }
+            }
+        },
+    )
+    store = SecretStore(path=Path("s.json"), values={"pw": "hunter2", "tok": "abc"})
+    configuration = _load(tmp_path, secrets=store)
+    settings = configuration.instances["Mail"].settings
+    assert settings["password"] == "hunter2"
+    assert settings["nested"] == {"token": "abc"}
+    assert settings["list"] == ["hunter2", 5]
+
+
+def test_a_missing_secret_is_a_config_error(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {"instances": {"Mail": {"plugin": "imap-input", "config": {"password": "${secret:pw}"}}}},
+    )
+    errors = _errors(tmp_path)
+    assert "undefined secret 'pw'" in errors[0]
+    assert "(none defined)" in errors[0]
+
+
+def test_a_missing_secret_lists_the_defined_ones(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {"instances": {"Mail": {"plugin": "imap-input", "config": {"password": "${secret:pw}"}}}},
+    )
+    store = SecretStore(path=Path("s.json"), values={"other": "x"})
+    errors = _errors(tmp_path, secrets=store)
+    assert "defines: other" in errors[0]
+
+
+# -- plugin-supplied settings validation --------------------------------------
+
+
+def test_plugin_settings_validation_errors_are_reported(tmp_path: Path) -> None:
+    def validate(settings: Mapping[str, object]) -> list[str]:
+        problems: list[str] = []
+        if "host" not in settings:
+            problems.append('"host" is required')
+        if "folder" not in settings:
+            problems.append('"folder" is required')
+        return problems
+
+    known = {
+        "imap-input": KnownPlugin(
+            plugin_name="imap-input", directions=INPUT_ONLY, validate_settings=validate
+        )
+    }
+    _write(tmp_path, "a.json", {"instances": {"Mail": {"plugin": "imap-input", "config": {}}}})
+    errors = _errors(tmp_path, known=known)
+    assert len(errors) == 2
+    assert '"host" is required' in errors[0]
+    assert '"folder" is required' in errors[1]
+
+
+def test_plugin_settings_validation_sees_resolved_secrets(tmp_path: Path) -> None:
+    seen: list[Mapping[str, object]] = []
+
+    def validate(settings: Mapping[str, object]) -> list[str]:
+        seen.append(settings)
+        return []
+
+    known = {
+        "imap-input": KnownPlugin(
+            plugin_name="imap-input", directions=INPUT_ONLY, validate_settings=validate
+        )
+    }
+    _write(
+        tmp_path,
+        "a.json",
+        {"instances": {"Mail": {"plugin": "imap-input", "config": {"password": "${secret:pw}"}}}},
+    )
+    store = SecretStore(path=Path("s.json"), values={"pw": "hunter2"})
+    _load(tmp_path, secrets=store, known=known)
+    assert seen == [{"password": "hunter2"}]
