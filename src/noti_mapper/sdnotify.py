@@ -15,6 +15,8 @@ import os
 import socket
 
 NOTIFY_SOCKET_ENVIRONMENT = "NOTIFY_SOCKET"
+WATCHDOG_USEC_ENVIRONMENT = "WATCHDOG_USEC"
+WATCHDOG_PID_ENVIRONMENT = "WATCHDOG_PID"
 
 
 class Notifier:
@@ -64,3 +66,26 @@ class Notifier:
                 notify_socket.sendall(message.encode("utf-8"))
         except OSError as error:
             self._log.debug("could not notify systemd: %s", error)
+
+
+def watchdog_interval_seconds() -> float | None:
+    """Return how often systemd expects a ping, or None if no watchdog is set.
+
+    systemd's convention is to ping at half the configured interval, and that
+    halving is applied here so callers do not each have to remember it.
+    """
+    raw = os.environ.get(WATCHDOG_USEC_ENVIRONMENT)
+    if not raw:
+        return None
+
+    expected_pid = os.environ.get(WATCHDOG_PID_ENVIRONMENT)
+    if expected_pid and expected_pid != str(os.getpid()):
+        return None
+
+    try:
+        microseconds = int(raw)
+    except ValueError:
+        return None
+    if microseconds <= 0:
+        return None
+    return microseconds / 2_000_000.0
