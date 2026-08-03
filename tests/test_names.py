@@ -5,6 +5,7 @@ from noti_mapper.names import (
     InvalidNameError,
     find_name_problems,
     normalize_name,
+    uniqueness_key,
     validate_name,
 )
 
@@ -82,3 +83,15 @@ def test_interior_whitespace_is_preserved() -> None:
 def test_length_is_measured_after_stripping() -> None:
     padded = "  " + "x" * MAX_NAME_LENGTH + "  "
     assert find_name_problems(padded) == []
+
+
+def test_uniqueness_key_is_case_insensitive() -> None:
+    assert uniqueness_key("Porch Mail") == uniqueness_key("porch mail")
+    assert uniqueness_key("Porch Mail") != uniqueness_key("Porch Mai")
+
+
+def test_uniqueness_key_normalizes_unicode_composition() -> None:
+    precomposed = "Café"
+    decomposed = "Café"
+    assert precomposed != decomposed
+    assert uniqueness_key(precomposed) == uniqueness_key(decomposed)
