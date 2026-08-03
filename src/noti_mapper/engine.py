@@ -16,16 +16,19 @@ import datetime
 import logging
 import queue
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from noti_mapper.clock import Clock
 from noti_mapper.config import DaemonSettings
 from noti_mapper.dispatcher import Dispatcher
 from noti_mapper.messages import (
+    CatchUpMessage,
     CoreMessage,
     InputEventMessage,
     PollHealthMessage,
     PushResultMessage,
+    ReconcileOutputMessage,
+    ReloadMessage,
     ShutdownMessage,
     UnlatchRequestMessage,
 )
@@ -33,10 +36,13 @@ from noti_mapper.plugin import (
     InputPlugin,
     ObservedEvent,
     OutputPlugin,
+    PluginHealth,
 )
 from noti_mapper.rules import RuleGraph
 from noti_mapper.storage import (
     EventKind,
+    HealthRecord,
+    HealthStatus,
     LatchRecord,
     Store,
 )
@@ -154,6 +160,189 @@ class Engine:
 
     def request_stop(self) -> None:
         self.submit(ShutdownMessage())
+
+    # -- the loop -------------------------------------------------------------
+
+    def run(self) -> None:
+        """Consume the queue until told to stop. Owns the calling thread."""
+        self._log.info("core loop running")
+
+        while not self._stopping:
+            timeout = self._next_timeout()
+            try:
+                message = self._queue.get(timeout=timeout)
+            except queue.Empty:
+                self._tick()
+                continue
+            self._handle(message)
+            if not self._stopping:
+                self._tick()
+
+        self._on_stop()
+
+    def drain(self) -> int:
+        """Process everything currently queued, then return.
+
+        Each round processes the queue and runs one tick; a tick can dispatch
+        pushes whose results land back on the queue, so rounds repeat until
+        nothing is left. Returns the number of messages handled.
+
+        This is what :meth:`run` does between blocking waits, factored out so
+        that a test can step the core deterministically instead of racing it.
+        """
+        handled = 0
+        for _ in range(MAX_DRAIN_ROUNDS):
+            processed = False
+            while True:
+                try:
+                    message = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._handle(message)
+                handled += 1
+                processed = True
+            self._tick()
+            if not processed and self._queue.empty():
+                return handled
+        self._log.error(
+            "drain did not settle after %d rounds; something is generating "
+            "messages faster than the core can retire them",
+            MAX_DRAIN_ROUNDS,
+        )
+        return handled
+
+    def _on_stop(self) -> None:
+        now = self._clock.now()
+        with self._store.database.transaction():
+            self._store.write_last_seen_at(now)
+            self._append_event(at=now, kind=EventKind.DAEMON_STOPPED)
+        self._log.info("core loop stopped")
+
+    def _next_timeout(self) -> float:
+        now = self._clock.now()
+        deadlines: list[datetime.datetime] = []
+
+        for timer in self._timers:
+            deadlines.append(timer.at)
+
+        soonest_push = self._store.earliest_pending_attempt()
+        if soonest_push is not None:
+            deadlines.append(soonest_push)
+
+        if not deadlines:
+            return LOOP_MAX_INTERVAL_SECONDS
+
+        seconds = (min(deadlines) - now).total_seconds()
+        if seconds < 0.0:
+            return 0.0
+        return min(seconds, LOOP_MAX_INTERVAL_SECONDS)
+
+    def _tick(self) -> None:
+        now = self._clock.now()
+        self._fire_due_timers(now)
+        self._dispatch_due_pushes(now)
+        self._maybe_write_last_seen(now)
+
+    def _fire_due_timers(self, now: datetime.datetime) -> None:
+        due: list[_ScheduledMessage] = []
+        remaining: list[_ScheduledMessage] = []
+        for timer in self._timers:
+            if timer.at <= now:
+                due.append(timer)
+            else:
+                remaining.append(timer)
+        self._timers = remaining
+        for timer in due:
+            self._handle(timer.message)
+
+    def _schedule(self, *, after_seconds: float, message: CoreMessage) -> None:
+        at = self._clock.now() + datetime.timedelta(seconds=after_seconds)
+        self._timers.append(_ScheduledMessage(at=at, message=message))
+
+    def _maybe_write_last_seen(self, now: datetime.datetime) -> None:
+        previous = self._last_seen_written_at
+        if previous is not None:
+            elapsed = (now - previous).total_seconds()
+            if elapsed < LAST_SEEN_INTERVAL_SECONDS:
+                return
+        with self._store.database.transaction():
+            self._store.write_last_seen_at(now)
+        self._last_seen_written_at = now
+
+    # -- message dispatch -----------------------------------------------------
+
+    def _handle(self, message: CoreMessage) -> None:
+        if isinstance(message, InputEventMessage):
+            self._handle_input_event(message)
+        elif isinstance(message, UnlatchRequestMessage):
+            self._handle_unlatch(message)
+        elif isinstance(message, PushResultMessage):
+            self._handle_push_result(message)
+        elif isinstance(message, ReloadMessage):
+            self._handle_reload(message)
+        elif isinstance(message, ReconcileOutputMessage):
+            self._handle_reconcile_retry(message)
+        elif isinstance(message, CatchUpMessage):
+            self._handle_catch_up_retry(message)
+        elif isinstance(message, PollHealthMessage):
+            self._handle_poll_health()
+        else:
+            self._stopping = True
+
+    def _dispatch_due_pushes(self, now: datetime.datetime) -> None:
+        due = self._store.pending_pushes_due(now)
+        if not due:
+            return
+
+        ready: list[tuple[str, bool]] = []
+        with self._store.database.transaction():
+            for push in due:
+                if push.instance_name in self._in_flight:
+                    continue
+                if push.instance_name not in self._plugins.outputs:
+                    self._store.delete_pending_push(push.instance_name)
+                    continue
+
+                # A push is always "apply current state", never "apply the
+                # delta that failed". The value is recomputed here, at dispatch
+                # time, so replaying a stale value is impossible.
+                desired = self._graph.desired_output_state(
+                    instance_name=push.instance_name, latches=self.latch_states()
+                )
+                if desired != push.target_value:
+                    self._store.write_pending_push(replace(push, target_value=desired))
+                ready.append((push.instance_name, desired))
+
+        for instance_name, value in ready:
+            self._in_flight.add(instance_name)
+            self._dispatcher.dispatch(instance_name=instance_name, value=value)
+
+    # -- health ---------------------------------------------------------------
+
+    def _handle_poll_health(self) -> None:
+        now = self._clock.now()
+        with self._store.database.transaction():
+            for name, plugin in self._plugins.inputs.items():
+                self._record_health(name=name, health=self._ask_health(name, plugin), now=now)
+            for name, output in self._plugins.outputs.items():
+                self._record_health(name=name, health=self._ask_health(name, output), now=now)
+        self._schedule(after_seconds=HEALTH_POLL_INTERVAL_SECONDS, message=PollHealthMessage())
+
+    def _ask_health(self, name: str, plugin: InputPlugin | OutputPlugin) -> PluginHealth:
+        try:
+            return plugin.health()
+        except BaseException as error:  # noqa: BLE001 - a plugin must not kill the core
+            self._log.warning("health() on %s raised: %s", name, error, extra={"instance": name})
+            return PluginHealth(
+                status=HealthStatus.FAILED, detail=f"{type(error).__name__}: {error}"
+            )
+
+    def _record_health(self, *, name: str, health: PluginHealth, now: datetime.datetime) -> None:
+        self._store.write_health(
+            HealthRecord(
+                instance_name=name, status=health.status, detail=health.detail, updated_at=now
+            )
+        )
 
     # -- small helpers --------------------------------------------------------
 
