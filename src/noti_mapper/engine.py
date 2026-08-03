@@ -764,6 +764,83 @@ class Engine:
             )
             return RemoteState(belief=RemoteBelief.UNKNOWN)
 
+    def _handle_reconcile_retry(self, message: ReconcileOutputMessage) -> None:
+        plugin = self._plugins.outputs.get(message.instance_name)
+        if plugin is None:
+            return
+
+        state = self._query_output(instance_name=message.instance_name, plugin=plugin)
+        if state.belief is RemoteBelief.UNKNOWN:
+            delay = min(
+                RECONCILE_RETRY_INITIAL_SECONDS * (2**message.attempt),
+                RECONCILE_RETRY_MAX_SECONDS,
+            )
+            self._schedule(
+                after_seconds=delay,
+                message=ReconcileOutputMessage(
+                    instance_name=message.instance_name, attempt=message.attempt + 1
+                ),
+            )
+            return
+
+        now = self._clock.now()
+        self._log.info(
+            "output %s answered on retry %d: %s",
+            message.instance_name,
+            message.attempt,
+            state.belief.value,
+            extra={"instance": message.instance_name},
+        )
+
+        with self._store.database.transaction():
+            for rule in self._graph.rules_for_output(message.instance_name):
+                self._apply_reconcile_outcome(
+                    rule_name=rule.name,
+                    outcome=resolve_rule(
+                        now=now,
+                        persisted=self._latch(rule.name),
+                        latest_downtime_event=None,
+                        output_reports=[state],
+                    ),
+                    extra_triggers=0,
+                    now=now,
+                )
+            affected = self._graph.outputs_affected_by(
+                [rule.name for rule in self._graph.rules_for_output(message.instance_name)]
+            )
+            self._sync_outputs(affected, now=now)
+
+    def _handle_catch_up_retry(self, message: CatchUpMessage) -> None:
+        plugin = self._plugins.inputs.get(message.instance_name)
+        if plugin is None:
+            return
+
+        try:
+            events = plugin.catch_up(message.since)
+        except BaseException as error:  # noqa: BLE001 - retried, not fatal
+            delay = min(
+                RECONCILE_RETRY_INITIAL_SECONDS * (2**message.attempt),
+                RECONCILE_RETRY_MAX_SECONDS,
+            )
+            self._log.warning(
+                "catch_up on %s failed again (attempt %d), retrying in %.0fs: %s",
+                message.instance_name,
+                message.attempt,
+                delay,
+                error,
+                extra={"instance": message.instance_name},
+            )
+            self._schedule(
+                after_seconds=delay,
+                message=replace(message, attempt=message.attempt + 1),
+            )
+            return
+
+        for event in events:
+            self._handle_input_event(
+                InputEventMessage(instance_name=message.instance_name, event=event)
+            )
+
     # -- small helpers --------------------------------------------------------
 
     def _latch(self, rule_name: str) -> LatchRecord:
