@@ -34,11 +34,12 @@ from noti_mapper.config import (
     InstanceConfig,
     load_configuration,
 )
-from noti_mapper.discovery import DiscoveryResult, known_plugins
+from noti_mapper.discovery import DiscoveryResult, discover, known_plugins
 from noti_mapper.dispatcher import OutputDispatcher
 from noti_mapper.engine import Engine, PluginSet
 from noti_mapper.messages import PushResultMessage, ReloadMessage
 from noti_mapper.plugin import InputPlugin, OutputPlugin, PluginContext
+from noti_mapper.rules import RuleGraph
 from noti_mapper.sdnotify import Notifier, watchdog_interval_seconds
 from noti_mapper.secrets import SecretsError, load_secrets
 from noti_mapper.storage import (
@@ -48,6 +49,8 @@ from noti_mapper.storage import (
     PluginKeyValueStore,
     RuleRecord,
     Store,
+    database_path,
+    initialize,
 )
 
 # How long an input instance may sit in a FAILED state before the watchdog
@@ -124,6 +127,94 @@ class Daemon:
         self._shutting_down = threading.Event()
         self._reload_thread: threading.Thread | None = None
         self._watchdog_thread: threading.Thread | None = None
+
+    # -- startup --------------------------------------------------------------
+
+    def start(self) -> None:
+        """Everything up to and including READY=1."""
+        self._discovery = discover(
+            search_path=list(self._paths.plugin_directories), logger=self._log
+        )
+        configuration = self._load_configuration()
+        self._configuration = configuration
+
+        database = Database(path=database_path(self._paths.state_directory))
+        initialize(database)
+        self._database = database
+        store = Store(database=database)
+        self._store = store
+        self._mirror_configuration(store=store, configuration=configuration)
+
+        graph = RuleGraph.from_configuration(configuration, logger=self._log)
+        dispatcher = OutputDispatcher(
+            outputs={},
+            report=self._report_push_result,
+            thread_count=configuration.daemon.dispatcher_threads,
+            logger=self._log,
+        )
+        self._dispatcher = dispatcher
+
+        engine = Engine(
+            store=store,
+            graph=graph,
+            plugins=PluginSet.empty(),
+            dispatcher=dispatcher,
+            clock=self._clock,
+            settings=configuration.daemon,
+            logger=self._log.getChild("engine"),
+        )
+        self._engine = engine
+
+        live = self._build_instances(configuration=configuration, database=database)
+        self._live = live
+        plugins = _plugin_set(live)
+        engine.submit(ReloadMessage(configuration=configuration, plugins=plugins))
+        engine.drain()
+
+        dispatcher.start()
+        self._start_instances(list(live.values()))
+
+        self._notifier.status("reconciling")
+        engine.reconcile()
+
+        self._install_signal_handlers()
+        self._start_background_threads()
+
+        self._notifier.ready(status=self._status_line())
+        self._log.info(
+            "ready: %d rules, %d instances",
+            len(configuration.rules),
+            len(configuration.instances),
+        )
+
+    def run(self) -> None:
+        """Own the calling thread with the core loop until shutdown."""
+        engine = self._require_engine()
+        engine.run()
+
+    def stop(self) -> None:
+        """Shut everything down. Safe to call more than once."""
+        if self._shutting_down.is_set():
+            return
+        self._shutting_down.set()
+        self._notifier.stopping()
+        self._reload_requested.set()
+
+        if self._engine is not None:
+            self._engine.request_stop()
+
+        self._stop_instances(list(self._live.values()))
+        self._live.clear()
+
+        if self._dispatcher is not None:
+            self._dispatcher.stop()
+
+        for thread in (self._reload_thread, self._watchdog_thread):
+            if thread is not None:
+                thread.join(timeout=PLUGIN_STOP_TIMEOUT_SECONDS)
+
+        if self._database is not None:
+            self._database.close()
 
     # -- configuration --------------------------------------------------------
 
