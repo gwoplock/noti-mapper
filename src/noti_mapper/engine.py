@@ -16,7 +16,7 @@ import datetime
 import logging
 import queue
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from noti_mapper.clock import Clock
@@ -38,7 +38,10 @@ from noti_mapper.plugin import (
     ObservedEvent,
     OutputPlugin,
     PluginHealth,
+    RemoteBelief,
+    RemoteState,
 )
+from noti_mapper.reconcile import ReconcileOutcome, resolve_rule
 from noti_mapper.rules import RuleGraph
 from noti_mapper.storage import (
     EventKind,
@@ -611,6 +614,156 @@ class Engine:
             )
         )
 
+    # -- reconciliation -------------------------------------------------------
+
+    def reconcile(self) -> None:
+        """Bring persisted state, inputs, and outputs into agreement.
+
+        Run once, before :meth:`run`, on the thread that will own the loop. An
+        unreachable plugin does not block startup: it falls back to persisted
+        state, logs a warning, and is retried in the background.
+        """
+        now = self._clock.now()
+        since = self._store.last_seen_at()
+        self._log.info(
+            "reconciling; last seen %s",
+            "never" if since is None else since.isoformat(),
+        )
+
+        downtime = self._collect_downtime_events(since=since, now=now)
+        reports = self._collect_remote_states(now=now)
+
+        with self._store.database.transaction():
+            self._append_event(at=now, kind=EventKind.DAEMON_STARTED)
+            for rule in self._graph.rules():
+                latest_event, event_count = _summarize(downtime, rule.inputs)
+                rule_reports: list[RemoteState] = []
+                for output_name in rule.outputs:
+                    report = reports.get(output_name)
+                    if report is not None:
+                        rule_reports.append(report)
+
+                self._apply_reconcile_outcome(
+                    rule_name=rule.name,
+                    outcome=resolve_rule(
+                        now=now,
+                        persisted=self._latch(rule.name),
+                        latest_downtime_event=latest_event,
+                        output_reports=rule_reports,
+                    ),
+                    extra_triggers=event_count,
+                    now=now,
+                )
+
+            # Step 5: force every output into agreement with the result.
+            for output_name in self._graph.output_names():
+                self._sync_output(output_name, now=now, force=True)
+
+            self._store.write_last_seen_at(now)
+
+        self._last_seen_written_at = now
+        self._dispatch_due_pushes(now)
+        self._ready.set()
+
+    def _apply_reconcile_outcome(
+        self,
+        *,
+        rule_name: str,
+        outcome: ReconcileOutcome,
+        extra_triggers: int,
+        now: datetime.datetime,
+    ) -> None:
+        record = self._latch(rule_name)
+        updated = replace(
+            record,
+            state=outcome.state,
+            set_at=outcome.set_at,
+            cleared_at=outcome.cleared_at,
+            trigger_count=record.trigger_count + extra_triggers,
+        )
+        changed = updated != record
+        if changed:
+            self._write_latch(updated)
+
+        self._append_event(
+            at=now,
+            kind=EventKind.RECONCILED,
+            rule_name=rule_name,
+            detail=f"state={outcome.state} reason={outcome.reason}",
+        )
+        if outcome.changed_from(record):
+            self._log.info(
+                "reconciled rule %r to %s: %s",
+                rule_name,
+                outcome.state,
+                outcome.reason,
+                extra={"rule": rule_name, "state": outcome.state, "reason": outcome.reason},
+            )
+        else:
+            self._log.debug(
+                "reconciled rule %r unchanged (%s): %s",
+                rule_name,
+                outcome.state,
+                outcome.reason,
+                extra={"rule": rule_name},
+            )
+
+    def _collect_downtime_events(
+        self, *, since: datetime.datetime | None, now: datetime.datetime
+    ) -> dict[str, list[ObservedEvent]]:
+        del now
+        collected: dict[str, list[ObservedEvent]] = {}
+        for instance_name in self._graph.input_names():
+            plugin = self._plugins.inputs.get(instance_name)
+            if plugin is None:
+                continue
+            try:
+                collected[instance_name] = plugin.catch_up(since)
+            except BaseException as error:  # noqa: BLE001 - must not block startup
+                self._log.warning(
+                    "catch_up on %s failed, falling back to persisted state: %s",
+                    instance_name,
+                    error,
+                    extra={"instance": instance_name},
+                )
+                self._schedule(
+                    after_seconds=RECONCILE_RETRY_INITIAL_SECONDS,
+                    message=CatchUpMessage(instance_name=instance_name, attempt=1, since=since),
+                )
+        return collected
+
+    def _collect_remote_states(self, *, now: datetime.datetime) -> dict[str, RemoteState]:
+        del now
+        collected: dict[str, RemoteState] = {}
+        for instance_name in self._graph.output_names():
+            plugin = self._plugins.outputs.get(instance_name)
+            if plugin is None:
+                continue
+            state = self._query_output(instance_name=instance_name, plugin=plugin)
+            if state.belief is RemoteBelief.UNKNOWN:
+                self._log.warning(
+                    "output %s could not be reached during reconciliation; "
+                    "falling back to persisted state and retrying in the background",
+                    instance_name,
+                    extra={"instance": instance_name},
+                )
+                self._schedule(
+                    after_seconds=RECONCILE_RETRY_INITIAL_SECONDS,
+                    message=ReconcileOutputMessage(instance_name=instance_name, attempt=1),
+                )
+                continue
+            collected[instance_name] = state
+        return collected
+
+    def _query_output(self, *, instance_name: str, plugin: OutputPlugin) -> RemoteState:
+        try:
+            return plugin.query()
+        except BaseException as error:  # noqa: BLE001 - must not block startup
+            self._log.warning(
+                "query() on %s raised: %s", error, instance_name, extra={"instance": instance_name}
+            )
+            return RemoteState(belief=RemoteBelief.UNKNOWN)
+
     # -- small helpers --------------------------------------------------------
 
     def _latch(self, rule_name: str) -> LatchRecord:
@@ -676,3 +829,17 @@ class UnlatchFor:
 
     def __call__(self, cause: str) -> None:
         self.engine.submit(UnlatchRequestMessage(instance_name=self.instance_name, cause=cause))
+
+
+def _summarize(
+    downtime: Mapping[str, Sequence[ObservedEvent]], instance_names: Sequence[str]
+) -> tuple[datetime.datetime | None, int]:
+    """Return the latest downtime event timestamp across these inputs, and a count."""
+    latest: datetime.datetime | None = None
+    count = 0
+    for instance_name in instance_names:
+        for event in downtime.get(instance_name, []):
+            count += 1
+            if latest is None or event.occurred_at > latest:
+                latest = event.occurred_at
+    return (latest, count)
