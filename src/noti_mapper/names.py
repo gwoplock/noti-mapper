@@ -31,6 +31,10 @@ MAX_NAME_LENGTH: int = 128
 ALLOWED_PUNCTUATION: frozenset[str] = frozenset(" -_.")
 
 
+class InvalidNameError(ValueError):
+    """A name violates the naming rules."""
+
+
 def normalize_name(raw: str) -> str:
     """Strip leading and trailing whitespace. Interior whitespace is preserved."""
     return raw.strip()
@@ -81,3 +85,16 @@ def find_name_problems(raw: str) -> list[str]:
         )
 
     return problems
+
+
+def validate_name(raw: str) -> str:
+    """Normalize and validate a name, returning it. Raises on any problem.
+
+    Use this at boundaries that handle one name at a time -- CLI arguments, for
+    example. Config validation uses :func:`find_name_problems` instead so that
+    it can accumulate errors.
+    """
+    problems = find_name_problems(raw)
+    if problems:
+        raise InvalidNameError(f"{raw!r}: " + "; ".join(problems))
+    return normalize_name(raw)
