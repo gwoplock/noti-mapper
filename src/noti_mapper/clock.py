@@ -73,3 +73,21 @@ class ManualClock(Clock):
         with self._lock:
             self._now = self._now + datetime.timedelta(seconds=seconds)
             self._monotonic += seconds
+
+
+def to_iso(moment: datetime.datetime) -> str:
+    """Format a timestamp for storage: UTC, ISO 8601, microsecond resolution.
+
+    Stored timestamps sort correctly as text because the format is fixed.
+    """
+    if moment.tzinfo is None:
+        raise ValueError("refusing to store a naive timestamp")
+    return moment.astimezone(datetime.UTC).isoformat(timespec="microseconds")
+
+
+def from_iso(text: str) -> datetime.datetime:
+    """Parse a timestamp written by :func:`to_iso`."""
+    parsed = datetime.datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        raise ValueError(f"stored timestamp {text!r} has no timezone")
+    return parsed.astimezone(datetime.UTC)
