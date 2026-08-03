@@ -24,8 +24,11 @@ does this instance touch" and "what should this output be, given these
 latches", and nothing else.
 """
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+
+from noti_mapper.config import Configuration
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,42 @@ class RuleGraph:
                 self._by_input.setdefault(instance_name, []).append(rule)
             for instance_name in rule.outputs:
                 self._by_output.setdefault(instance_name, []).append(rule)
+
+    @classmethod
+    def from_configuration(
+        cls, configuration: Configuration, *, logger: logging.Logger | None = None
+    ) -> "RuleGraph":
+        """Build the graph from configuration, dropping what is disabled.
+
+        A disabled instance is removed from every rule's lists rather than the
+        rules being removed: a rule whose inputs are all disabled can still be
+        cleared, and a rule whose outputs are all disabled still latches. Both
+        are worth a warning, because a rule with no outputs left has no way to
+        be unlatched.
+        """
+        log = logger if logger is not None else logging.getLogger(__name__)
+        enabled_instances = {instance.name for instance in configuration.enabled_instances()}
+
+        rules: list[Rule] = []
+        for rule_config in configuration.enabled_rules():
+            inputs = tuple(name for name in rule_config.inputs if name in enabled_instances)
+            outputs = tuple(name for name in rule_config.outputs if name in enabled_instances)
+            if not outputs:
+                log.warning(
+                    "rule %r has no enabled outputs; it can latch but nothing can "
+                    "unlatch it except an operator",
+                    rule_config.name,
+                    extra={"rule": rule_config.name},
+                )
+            if not inputs:
+                log.warning(
+                    "rule %r has no enabled inputs; nothing can set its latch",
+                    rule_config.name,
+                    extra={"rule": rule_config.name},
+                )
+            rules.append(Rule(name=rule_config.name, inputs=inputs, outputs=outputs))
+
+        return cls(rules)
 
     def rules(self) -> list[Rule]:
         return [self._rules[name] for name in sorted(self._rules)]
