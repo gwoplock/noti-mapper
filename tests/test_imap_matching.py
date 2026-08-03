@@ -7,6 +7,7 @@ The near-miss negatives matter more than the positives. A rule that fires on
 import pytest
 
 from imap_input.matching import Criteria, compile_problems, decode_subject, sender_address
+from imap_input.settings import build, validate
 
 CARRIER_SENDERS = ["amazon.com", "ups.com", "fedex.com", "usps.com"]
 DELIVERED_PATTERNS = [
@@ -150,6 +151,76 @@ def test_a_missing_subject_is_the_empty_string() -> None:
 def test_sender_address_extracts_from_a_display_name() -> None:
     assert sender_address('"UPS Quantum View" <mcinfo@ups.com>') == "mcinfo@ups.com"
     assert sender_address(None) == ""
+
+
+# -- settings -----------------------------------------------------------------
+
+
+def _settings(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "host": "mail.example.net",
+        "username": "user@example.net",
+        "password": "hunter2",
+        "senders": CARRIER_SENDERS,
+        "subject_patterns": DELIVERED_PATTERNS,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_a_complete_configuration_validates() -> None:
+    assert validate(_settings()) == []
+
+
+def test_every_required_key_is_reported() -> None:
+    problems = validate({})
+    assert len(problems) == 5
+    for key in ("host", "username", "password", "senders", "subject_patterns"):
+        assert any(f'"{key}" is required' in problem for problem in problems)
+
+
+def test_an_unknown_setting_is_reported() -> None:
+    problems = validate(_settings(mailbox="INBOX"))
+    assert problems == ['unknown setting "mailbox"']
+
+
+def test_an_invalid_subject_pattern_is_reported() -> None:
+    problems = validate(_settings(subject_patterns=["^Delivered:", "[unclosed"]))
+    assert any("is not a valid regex" in problem for problem in problems)
+
+
+def test_empty_lists_are_rejected() -> None:
+    assert any("non-empty array" in problem for problem in validate(_settings(senders=[])))
+    assert any("non-empty array" in problem for problem in validate(_settings(subject_patterns=[])))
+
+
+def test_type_errors_are_reported() -> None:
+    assert any("positive integer" in problem for problem in validate(_settings(port=0)))
+    assert any("positive integer" in problem for problem in validate(_settings(port=True)))
+    assert any("true or false" in problem for problem in validate(_settings(dry_run="yes")))
+    assert any("non-empty string" in problem for problem in validate(_settings(host="")))
+
+
+def test_defaults_are_applied() -> None:
+    settings = build(_settings())
+    assert settings.port == 993
+    assert settings.use_ssl is True
+    assert settings.folder == "INBOX"
+    assert settings.idle_refresh_seconds == 1500
+    assert settings.poll_seconds == 60
+    assert settings.dry_run is False
+    assert settings.catch_up_limit == 200
+
+
+def test_the_default_port_follows_the_ssl_setting() -> None:
+    assert build(_settings(ssl=False)).port == 143
+    assert build(_settings(ssl=False, port=1143)).port == 1143
+
+
+def test_the_idle_refresh_default_is_below_the_rfc_guidance() -> None:
+    # RFC 2177 suggests 29 minutes; small hosts drop connections earlier, so
+    # the default is 25.
+    assert build(_settings()).idle_refresh_seconds < 29 * 60
 
 
 def test_compile_problems_reports_only_bad_patterns() -> None:
