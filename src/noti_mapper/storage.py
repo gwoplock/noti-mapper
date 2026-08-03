@@ -24,7 +24,7 @@ disjoint from everything the core writes.
 import contextlib
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 SCHEMA_VERSION: int = 1
@@ -252,3 +252,68 @@ class Store:
                 )
             )
         return records
+
+
+class PluginKeyValueStore:
+    """Durable per-instance scratch storage for plugins.
+
+    The IMAP reader needs somewhere to keep ``UIDVALIDITY`` and the last
+    processed UID. Plugins get this rather than managing their own files so
+    that there is one thing to back up and one thing to migrate.
+
+    This is the one part of the database plugins touch, it is reachable from
+    plugin threads, and it writes only to ``plugin_kv`` -- a table no other
+    code path writes.
+    """
+
+    def __init__(self, *, database: Database, instance_name: str) -> None:
+        self._database = database
+        self._instance_name = instance_name
+
+    @property
+    def instance_name(self) -> str:
+        return self._instance_name
+
+    def get(self, key: str) -> str | None:
+        row = (
+            self._database.connection()
+            .execute(
+                "SELECT value FROM plugin_kv WHERE instance_name = ? AND key = ?",
+                (self._instance_name, key),
+            )
+            .fetchone()
+        )
+        if row is None:
+            return None
+        return str(row["value"])
+
+    def set(self, key: str, value: str) -> None:
+        with self._database.transaction() as transaction:
+            transaction.execute(
+                """
+                INSERT INTO plugin_kv (instance_name, key, value) VALUES (?, ?, ?)
+                ON CONFLICT(instance_name, key) DO UPDATE SET value = excluded.value
+                """,
+                (self._instance_name, key, value),
+            )
+
+    def delete(self, key: str) -> None:
+        with self._database.transaction() as transaction:
+            transaction.execute(
+                "DELETE FROM plugin_kv WHERE instance_name = ? AND key = ?",
+                (self._instance_name, key),
+            )
+
+    def items(self) -> Mapping[str, str]:
+        rows = (
+            self._database.connection()
+            .execute(
+                "SELECT key, value FROM plugin_kv WHERE instance_name = ? ORDER BY key",
+                (self._instance_name,),
+            )
+            .fetchall()
+        )
+        result: dict[str, str] = {}
+        for row in rows:
+            result[str(row["key"])] = str(row["value"])
+        return result

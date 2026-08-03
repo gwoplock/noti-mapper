@@ -9,6 +9,7 @@ from noti_mapper.clock import from_iso, to_iso
 from noti_mapper.storage import (
     SCHEMA_VERSION,
     Database,
+    PluginKeyValueStore,
     StorageError,
     Store,
     database_path,
@@ -80,6 +81,28 @@ def test_each_thread_gets_its_own_connection(store: Store) -> None:
 
     assert len(seen) == 1
     assert seen[0] != main
+
+
+# -- plugin key/value ---------------------------------------------------------
+
+
+def test_plugin_kv_is_scoped_per_instance(store: Store) -> None:
+    first = PluginKeyValueStore(database=store.database, instance_name="Porch Mail")
+    second = PluginKeyValueStore(database=store.database, instance_name="Kitchen Mail")
+
+    first.set("uidvalidity", "111")
+    second.set("uidvalidity", "222")
+
+    assert first.get("uidvalidity") == "111"
+    assert second.get("uidvalidity") == "222"
+    assert dict(first.items()) == {"uidvalidity": "111"}
+
+    first.set("uidvalidity", "333")
+    assert first.get("uidvalidity") == "333"
+
+    first.delete("uidvalidity")
+    assert first.get("uidvalidity") is None
+    assert second.get("uidvalidity") == "222"
 
 
 # -- timestamps ---------------------------------------------------------------
