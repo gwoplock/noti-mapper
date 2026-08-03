@@ -6,10 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from noti_mapper.clock import from_iso, to_iso
+from noti_mapper.clock import ManualClock, from_iso, to_iso
 from noti_mapper.storage import (
     SCHEMA_VERSION,
     Database,
+    EventKind,
+    HealthRecord,
+    HealthStatus,
     InstanceRecord,
     LatchRecord,
     OutputStateRecord,
@@ -467,6 +470,90 @@ def test_plugin_kv_is_scoped_per_instance(store: Store) -> None:
     first.delete("uidvalidity")
     assert first.get("uidvalidity") is None
     assert second.get("uidvalidity") == "222"
+
+
+# -- health -------------------------------------------------------------------
+
+
+def test_health_round_trips(store: Store) -> None:
+    store.write_health(
+        HealthRecord(
+            instance_name="Mail",
+            status=HealthStatus.DEGRADED,
+            detail="IDLE unsupported, polling",
+            updated_at=MOMENT,
+        )
+    )
+    records = store.health()
+    assert len(records) == 1
+    assert records[0].status is HealthStatus.DEGRADED
+    assert records[0].detail == "IDLE unsupported, polling"
+
+
+# -- event log ----------------------------------------------------------------
+
+
+def test_event_log_records_and_reads_back(store: Store) -> None:
+    store.append_event(
+        at=MOMENT,
+        kind=EventKind.LATCH_SET,
+        rule_name="R",
+        instance_name="Mail",
+        detail="Delivered: your package",
+    )
+    entries = store.recent_events()
+    assert len(entries) == 1
+    assert entries[0].kind is EventKind.LATCH_SET
+    assert entries[0].rule_name == "R"
+    assert entries[0].instance_name == "Mail"
+    assert entries[0].detail == "Delivered: your package"
+    assert entries[0].at == MOMENT
+
+
+def test_event_log_rolls_oldest_first(store: Store) -> None:
+    clock = ManualClock(start=MOMENT)
+    for index in range(25):
+        store.append_event(
+            at=clock.now(), kind=EventKind.INPUT_EVENT, detail=f"event {index}", max_rows=10
+        )
+        clock.advance(1)
+
+    assert store.event_count() == 10
+    details = [entry.detail for entry in store.recent_events()]
+    assert details[0] == "event 24"
+    assert details[-1] == "event 15"
+
+
+def test_event_log_is_never_read_back_for_decisions(store: Store) -> None:
+    """Truncating the log must not change any state the daemon acts on."""
+    store.sync_rules([_rule("R", ("A",), ("B",))])
+    store.write_latch(
+        LatchRecord(
+            rule_name="R",
+            state=True,
+            set_at=MOMENT,
+            cleared_at=None,
+            trigger_count=4,
+            last_cause="A",
+        )
+    )
+    store.write_pending_push(
+        PendingPush(
+            instance_name="B",
+            target_value=True,
+            attempt_count=1,
+            next_attempt_at=MOMENT,
+            last_error=None,
+        )
+    )
+    store.append_event(at=MOMENT, kind=EventKind.LATCH_SET, rule_name="R")
+
+    before = (store.latches(), store.pending_pushes(), store.rules())
+    store.database.connection().execute("DELETE FROM event_log")
+    after = (store.latches(), store.pending_pushes(), store.rules())
+
+    assert before == after
+    assert store.event_count() == 0
 
 
 # -- timestamps ---------------------------------------------------------------
