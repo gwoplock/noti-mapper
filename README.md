@@ -41,8 +41,12 @@ VLAN.
 
 ## Status
 
-Pre-release. See `docs/` for the configuration reference and the plugin
-authoring guide.
+Pre-release.
+
+- [docs/configuration.md](docs/configuration.md) — every setting, and worked
+  examples of the rule semantics that surprise people.
+- [docs/plugin-authoring.md](docs/plugin-authoring.md) — writing your own
+  input or output.
 
 ## Plugins
 
