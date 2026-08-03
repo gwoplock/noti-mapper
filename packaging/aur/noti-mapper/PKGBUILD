@@ -1,0 +1,91 @@
+# Maintainer: Garrett Battaglia
+
+pkgname=noti-mapper
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Latch notification events onto outputs until acknowledged"
+arch=('any')
+url="https://github.com/gwoplock/noti-mapper"
+license=('MIT')
+
+# System dependencies, not a vendored virtualenv. The core itself uses only the
+# standard library; these are what the shipped plugins import.
+#
+#   python-imapclient       IMAP reader (IDLE support)
+#   python-hap-python       HomeKit output; companion AUR package in this repo
+#   python-zeroconf         HAP-python's mDNS layer
+#   avahi                   Bonjour on the host. Its absence is a confusing
+#                           runtime failure rather than an install-time one,
+#                           which is exactly why it is declared here.
+depends=(
+  'python'
+  'python-imapclient'
+  'python-hap-python'
+  'python-zeroconf'
+  'avahi'
+)
+makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
+checkdepends=('python-pytest')
+
+install="${pkgname}.install"
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  # --outdir, because dist/ in this project holds the systemd unit and the
+  # example configuration rather than build artifacts.
+  python -m build --wheel --no-isolation --outdir=_build
+}
+
+check() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  pytest -q
+}
+
+package() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+
+  python -m installer --destdir="${pkgdir}" _build/*.whl
+
+  # Plugins are a filesystem scan, not an entry-point registry, so they are
+  # installed as plain directories.
+  install -dm755 "${pkgdir}/usr/lib/${pkgname}/plugins"
+  for plugin in plugins/*/; do
+    [ -f "${plugin}/__init__.py" ] || continue
+    cp -r "${plugin}" "${pkgdir}/usr/lib/${pkgname}/plugins/"
+  done
+  find "${pkgdir}/usr/lib/${pkgname}/plugins" -name '__pycache__' -type d -exec rm -rf {} +
+
+  install -Dm644 dist/noti-mapper.service \
+    "${pkgdir}/usr/lib/systemd/system/${pkgname}.service"
+  install -Dm644 dist/noti-mapper.sysusers \
+    "${pkgdir}/usr/lib/sysusers.d/${pkgname}.conf"
+
+  install -Dm644 dist/man/noti-mapper.1 "${pkgdir}/usr/share/man/man1/noti-mapper.1"
+  install -Dm644 dist/man/noti-mapper.d.5 "${pkgdir}/usr/share/man/man5/noti-mapper.d.5"
+
+  # Examples install to /usr/share/doc and never to /etc/noti-mapper.d. A
+  # package-installed configuration that goes live on first boot is a bad
+  # surprise: the daemon would start watching a mailbox nobody asked for.
+  install -Dm644 dist/examples/README.md \
+    "${pkgdir}/usr/share/doc/${pkgname}/examples/README.md"
+  install -Dm644 dist/examples/10-instances.json \
+    "${pkgdir}/usr/share/doc/${pkgname}/examples/10-instances.json"
+  install -Dm644 dist/examples/20-rules.json \
+    "${pkgdir}/usr/share/doc/${pkgname}/examples/20-rules.json"
+  install -Dm644 dist/examples/secrets.json \
+    "${pkgdir}/usr/share/doc/${pkgname}/examples/secrets.json"
+
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  for guide in docs/*.md; do
+    install -Dm644 "${guide}" "${pkgdir}/usr/share/doc/${pkgname}/$(basename "${guide}")"
+  done
+
+  install -Dm644 LICENSE.md "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE.md"
+
+  # The .d directory is created by the unit's ConfigurationDirectory=; this one
+  # is not, and is where secrets.json goes.
+  install -dm750 "${pkgdir}/etc/${pkgname}"
+  install -dm755 "${pkgdir}/etc/${pkgname}/plugins"
+}

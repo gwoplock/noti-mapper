@@ -1,0 +1,40 @@
+# Maintainer: Garrett Battaglia
+#
+# HAP-python has no Arch package and its own install documentation assumes a
+# virtualenv and pip. Shipping this companion package is the cost of declaring
+# system dependencies properly rather than vendoring a venv inside noti-mapper.
+
+_name=HAP-python
+pkgname=python-hap-python
+pkgver=5.0.0
+pkgrel=1
+pkgdesc="HomeKit Accessory Protocol implementation in Python"
+arch=('any')
+url="https://github.com/ikalchev/HAP-python"
+license=('Apache-2.0')
+depends=(
+  'python'
+  'python-cryptography'
+  'python-chacha20poly1305-reuseable'
+  'python-orjson'
+  'python-zeroconf'
+  'python-h11'
+)
+optdepends=(
+  'python-base36: QR code display for pairing'
+  'python-pyqrcode: QR code display for pairing'
+)
+makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
+source=("https://files.pythonhosted.org/packages/source/${_name:0:1}/${_name}/${_name}-${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "${_name}-${pkgver}"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "${_name}-${pkgver}"
+  python -m installer --destdir="${pkgdir}" dist/*.whl
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

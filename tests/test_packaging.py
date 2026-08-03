@@ -201,6 +201,52 @@ def test_the_man_pages_carry_the_current_version() -> None:
         assert f"noti-mapper {VERSION}" in page
 
 
+# -- the PKGBUILD -------------------------------------------------------------
+
+
+def test_the_pkgbuild_version_matches_the_package() -> None:
+    assert f"pkgver={VERSION}" in PKGBUILD.read_text(encoding="utf-8")
+
+
+def test_the_pkgbuild_declares_the_libraries_the_plugins_import() -> None:
+    text = PKGBUILD.read_text(encoding="utf-8")
+    for dependency in ("python-imapclient", "python-hap-python", "python-zeroconf", "avahi"):
+        assert f"'{dependency}'" in text
+
+
+def test_the_pkgbuild_installs_examples_to_doc_and_never_to_etc() -> None:
+    text = PKGBUILD.read_text(encoding="utf-8")
+    assert "/usr/share/doc/${pkgname}/examples/" in text
+
+    # Comments are allowed to mention the directory; install commands are not.
+    commands = [
+        line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    ]
+    for line in commands:
+        assert "/etc/noti-mapper.d" not in line, (
+            "a package-installed configuration that goes live on first boot is "
+            f"exactly the surprise this forbids: {line.strip()}"
+        )
+
+
+def test_the_pkgbuild_installs_the_plugins_as_directories() -> None:
+    text = PKGBUILD.read_text(encoding="utf-8")
+    assert "/usr/lib/${pkgname}/plugins" in text
+
+
+def test_every_shipped_plugin_directory_looks_installable() -> None:
+    plugins = source_checkout_plugin_directory()
+    assert plugins is not None
+    found = sorted(entry.name for entry in plugins.iterdir() if (entry / "__init__.py").is_file())
+    assert found == [
+        "file_input",
+        "homekit_output",
+        "imap_input",
+        "pagerduty_output",
+        "webhook_input",
+    ]
+
+
 def test_the_example_secrets_file_is_not_shipped_world_readable_by_accident() -> None:
     """The file in the repository is a template; the docs say to install it 0600."""
     mode = stat.S_IMODE((EXAMPLES / "secrets.json").stat().st_mode)
