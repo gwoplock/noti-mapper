@@ -40,6 +40,15 @@ def normalize_name(raw: str) -> str:
     return raw.strip()
 
 
+def uniqueness_key(name: str) -> str:
+    """Return the key used for case-insensitive uniqueness comparison.
+
+    Unicode is normalized to NFC first so that a precomposed and a decomposed
+    spelling of the same name collide rather than coexisting.
+    """
+    return unicodedata.normalize("NFC", name).casefold()
+
+
 def _character_is_allowed(character: str) -> bool:
     if character in ALLOWED_PUNCTUATION:
         return True
