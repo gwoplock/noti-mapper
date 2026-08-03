@@ -162,3 +162,39 @@ def test_a_clear_with_no_timestamp_and_no_event_clears() -> None:
     )
     assert outcome.state is False
     assert outcome.cleared_at == NOW
+
+
+# -- several outputs disagreeing ----------------------------------------------
+
+
+def test_one_output_reporting_cleared_beats_another_reporting_active() -> None:
+    outcome = resolve_rule(
+        now=NOW,
+        persisted=_latch(state=True),
+        latest_downtime_event=None,
+        output_reports=[ACTIVE, CLEARED],
+    )
+    assert outcome.state is False
+
+
+def test_the_most_recent_clear_wins_among_several() -> None:
+    early = RemoteState(belief=RemoteBelief.CLEARED, cleared_at=BEFORE_CLEAR)
+    late = RemoteState(belief=RemoteBelief.CLEARED, cleared_at=AFTER_CLEAR)
+    outcome = resolve_rule(
+        now=NOW,
+        persisted=_latch(state=True),
+        latest_downtime_event=CLEAR_TIME,
+        output_reports=[early, late],
+    )
+    assert outcome.state is False
+    assert outcome.cleared_at == AFTER_CLEAR
+
+
+def test_an_unreachable_output_does_not_veto_a_reachable_one() -> None:
+    outcome = resolve_rule(
+        now=NOW,
+        persisted=_latch(state=True),
+        latest_downtime_event=None,
+        output_reports=[UNKNOWN, CLEARED],
+    )
+    assert outcome.state is False
