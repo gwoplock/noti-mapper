@@ -22,7 +22,7 @@ from noti_mapper.names import (
     find_name_problems,
     normalize_name,
 )
-from noti_mapper.secrets import SecretStore
+from noti_mapper.secrets import SecretStore, substitute
 
 DEFAULT_CONFIG_DIRECTORY: Path = Path("/etc/noti-mapper.d")
 
@@ -510,6 +510,35 @@ class _Loader:
                 self._errors.append(ConfigError(f"instance {draft.name!r}: {problem}", where))
 
         return settings
+
+    def _resolve_secrets_object(
+        self, body: Mapping[str, object], where: ConfigPath
+    ) -> dict[str, object]:
+        members: dict[str, object] = {}
+        for key, value in body.items():
+            members[key] = self._resolve_secrets(value, where.key(key))
+        return members
+
+    def _resolve_secrets(self, value: object, where: ConfigPath) -> object:
+        if isinstance(value, str):
+            result = substitute(text=value, store=self._secrets)
+            for name in result.missing:
+                known = ", ".join(self._secrets.names()) or "(none defined)"
+                self._errors.append(
+                    ConfigError(
+                        f"undefined secret {name!r}; {self._secrets.path} defines: {known}",
+                        where,
+                    )
+                )
+            return result.text
+        if isinstance(value, list):
+            elements: list[object] = []
+            for index, element in enumerate(value):
+                elements.append(self._resolve_secrets(element, where.element(index)))
+            return elements
+        if isinstance(value, dict):
+            return self._resolve_secrets_object(value, where)
+        return value
 
     # -- rules ----------------------------------------------------------------
 
