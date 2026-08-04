@@ -10,8 +10,20 @@ Check your work before restarting:
 noti-mapper validate
 ```
 
-Every problem is reported with a file and a line, all in one pass. You should
-never have to fix errors one restart at a time.
+Every problem is reported in one pass, with the file it is in and the path
+through that file to the thing that is wrong:
+
+```
+noti-mapper: 2 configuration errors:
+  /etc/noti-mapper.d/10-instances.json: instances → 'Porch Mail' → plugin:
+      instance 'Porch Mail' refers to unknown plugin 'imap'. Plugins that loaded: ...
+  /etc/noti-mapper.d/20-rules.json: rules → 'Package On Porch' → inputs[0]:
+      rule 'Package On Porch' references unknown instance 'Porch Mial'; did you mean 'Porch Mail'?
+```
+
+You should never have to fix errors one restart at a time. A path rather than
+a line number, because the line moves when you reformat the file and the path
+does not.
 
 ## Names
 
@@ -287,7 +299,7 @@ trailing commas and comments are rejected, and so are `NaN` and `Infinity`.
 - a group- or world-readable secrets file
 - malformed JSON
 
-All of them are reported together with file and line.
+All of them are reported together, each with its file and path.
 
 ## Reload
 
