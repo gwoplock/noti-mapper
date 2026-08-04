@@ -104,3 +104,9 @@ def test_top_level_must_be_an_object(tmp_path: Path) -> None:
     tmp_path.joinpath("a.json").write_text("[]", encoding="utf-8")
     errors = _errors(tmp_path)
     assert "must be an object" in errors[0]
+
+
+def test_invalid_name_characters_are_rejected(tmp_path: Path) -> None:
+    _write(tmp_path, "a.json", {"instances": {"Porch/Mail": {"plugin": "imap-input"}}})
+    errors = _errors(tmp_path)
+    assert "disallowed characters" in errors[0]
