@@ -32,9 +32,9 @@ Run the daemon. This is what the systemd unit invokes. Readiness is signalled
 after configuration validation and initial reconciliation, never before.
 .TP
 .B validate
-Load and check the configuration, then exit. Every problem is reported with a
-file and a line in one pass. Exits 0 when the configuration is usable and 2
-when it is not.
+Load and check the configuration, then exit. Every problem is reported in one
+pass, with the file it is in and the path through that file to the thing that
+is wrong. Exits 0 when the configuration is usable and 2 when it is not.
 .TP
 .B status
 Print current latches, orphaned rules, output synchronisation state, pending
