@@ -68,17 +68,37 @@ def uniqueness_key(name: str) -> str:
 
 
 def _character_is_allowed(character: str) -> bool:
+    """True for letters, digits, and the four allowed punctuation characters.
+
+    ``str.isalnum()`` is the documented way to ask this. It is defined against
+    the Unicode character database and moves with the standard library's
+    Unicode version. Testing ``unicodedata.category()`` for an "L" or "N"
+    prefix would be reimplementing it by hand against two-letter category codes
+    -- and would quietly accept anything else that ever starts with those
+    letters.
+    """
     if character in ALLOWED_PUNCTUATION:
         return True
-    category = unicodedata.category(character)
-    return category.startswith("L") or category.startswith("N")
+    return character.isalnum()
 
 
 def _describe_character(character: str) -> str:
+    """Render one character for an error message.
+
+    The character on its own is no use when it is invisible, which is exactly
+    when someone needs the error, so this pairs its repr with what it actually
+    is. Most characters have a Unicode name, and "NO-BREAK SPACE" is precisely
+    what the reader needs to see.
+
+    Control characters have no Unicode name, so they fall back to the code
+    point written the way the Unicode standard writes it: "U+" followed by at
+    least four uppercase hexadecimal digits, zero-padded.
+    """
     try:
         return f"{character!r} ({unicodedata.name(character)})"
     except ValueError:
-        return f"{character!r} (U+{ord(character):04X})"
+        code_point = format(ord(character), "04X")
+        return f"{character!r} (U+{code_point})"
 
 
 def find_name_problems(raw: str) -> list[str]:
