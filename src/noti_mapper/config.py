@@ -11,7 +11,7 @@ is written to avoid.
 """
 
 import enum
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -549,6 +549,157 @@ class _Loader:
             if rule is not None:
                 rules[rule.name] = rule
         return rules
+
+    def _build_rule(
+        self, *, draft: _Draft, instances: Mapping[str, InstanceConfig]
+    ) -> RuleConfig | None:
+        self._reject_unknown_keys(
+            body=draft.body,
+            where=draft.origin,
+            allowed=_RULE_KEYS,
+            subject=f"rule {draft.name!r}",
+        )
+
+        inputs = self._rule_members(
+            draft=draft, key="inputs", direction=PluginDirection.INPUT, instances=instances
+        )
+        outputs = self._rule_members(
+            draft=draft, key="outputs", direction=PluginDirection.OUTPUT, instances=instances
+        )
+        if inputs is None or outputs is None:
+            return None
+
+        overlap = sorted(set(inputs) & set(outputs))
+        for name in overlap:
+            self._errors.append(
+                ConfigError(
+                    f"rule {draft.name!r} lists instance {name!r} as both an input and "
+                    "an output, which would make the rule latch itself",
+                    draft.origin,
+                )
+            )
+        if overlap:
+            return None
+
+        enabled = self._optional_bool(
+            body=draft.body,
+            where=draft.origin,
+            key="enabled",
+            default=True,
+            subject=f"rule {draft.name!r}",
+        )
+
+        return RuleConfig(
+            name=draft.name,
+            inputs=inputs,
+            outputs=outputs,
+            enabled=enabled,
+            origin=draft.origin,
+        )
+
+    def _rule_members(
+        self,
+        *,
+        draft: _Draft,
+        key: str,
+        direction: PluginDirection,
+        instances: Mapping[str, InstanceConfig],
+    ) -> tuple[str, ...] | None:
+        where = draft.origin.key(key)
+        if key not in draft.body:
+            self._errors.append(ConfigError(f'rule {draft.name!r} has no "{key}"', draft.origin))
+            return None
+
+        listed = draft.body[key]
+        if not isinstance(listed, list):
+            self._errors.append(
+                ConfigError(
+                    f'rule {draft.name!r}: "{key}" must be an array of instance names', where
+                )
+            )
+            return None
+        if not listed:
+            self._errors.append(
+                ConfigError(
+                    f'rule {draft.name!r}: "{key}" is empty; a rule with no {key} can '
+                    "never do anything",
+                    where,
+                )
+            )
+            return None
+
+        return self._resolve_members(
+            draft=draft, key=key, direction=direction, listed=listed, instances=instances
+        )
+
+    def _resolve_members(
+        self,
+        *,
+        draft: _Draft,
+        key: str,
+        direction: PluginDirection,
+        listed: Sequence[object],
+        instances: Mapping[str, InstanceConfig],
+    ) -> tuple[str, ...] | None:
+        names: list[str] = []
+        ok = True
+
+        for index, element in enumerate(listed):
+            here = draft.origin.key(key).element(index)
+            if not isinstance(element, str):
+                self._errors.append(
+                    ConfigError(
+                        f'rule {draft.name!r}: "{key}" entries must be instance names', here
+                    )
+                )
+                ok = False
+                continue
+
+            name = normalize_name(element)
+            if name in names:
+                self._errors.append(
+                    ConfigError(f'rule {draft.name!r}: {name!r} is listed twice in "{key}"', here)
+                )
+                ok = False
+                continue
+
+            instance = instances.get(name)
+            if instance is None:
+                if name not in self._broken_instances:
+                    self._errors.append(
+                        ConfigError(
+                            f"rule {draft.name!r} references unknown instance {name!r}"
+                            + self._suggestion_for(name),
+                            here,
+                        )
+                    )
+                ok = False
+                continue
+
+            if direction not in instance.directions:
+                actual = ", ".join(sorted(item.value for item in instance.directions))
+                self._errors.append(
+                    ConfigError(
+                        f'rule {draft.name!r} lists {name!r} under "{key}", but plugin '
+                        f"{instance.plugin!r} provides only: {actual}",
+                        here,
+                    )
+                )
+                ok = False
+                continue
+
+            names.append(name)
+
+        if not ok:
+            return None
+        return tuple(names)
+
+    def _suggestion_for(self, name: str) -> str:
+        suggestion = self._registry.suggest(name=name, namespace=Namespace.INSTANCE)
+        if suggestion is not None:
+            return f"; did you mean {suggestion!r}?"
+        known = ", ".join(self._registry.names(Namespace.INSTANCE)) or "(none)"
+        return f". Defined instances: {known}"
 
     # -- shared field helpers -------------------------------------------------
 
