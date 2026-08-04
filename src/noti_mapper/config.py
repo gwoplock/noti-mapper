@@ -19,6 +19,8 @@ from noti_mapper.jsonfile import JsonFileError, read_object
 from noti_mapper.names import (
     NameRegistry,
     Namespace,
+    find_name_problems,
+    normalize_name,
 )
 from noti_mapper.secrets import SecretStore
 
@@ -389,6 +391,48 @@ class _Loader:
             )
             return default
         return float(value)
+
+    # -- names ----------------------------------------------------------------
+
+    def _collect_named(
+        self, *, container: Mapping[str, object], namespace: Namespace, where: ConfigPath
+    ) -> None:
+        for raw_name, body in container.items():
+            here = where.named(raw_name)
+
+            problems = find_name_problems(raw_name)
+            if problems:
+                for problem in problems:
+                    self._errors.append(
+                        ConfigError(f"{namespace.value} name {raw_name!r}: {problem}", here)
+                    )
+                continue
+
+            name = normalize_name(raw_name)
+            conflict = self._registry.find_conflict(name=name, namespace=namespace)
+            if conflict is not None:
+                self._errors.append(
+                    ConfigError(
+                        f"duplicate {namespace.value} name {name!r}; already defined as "
+                        f"{conflict.name!r} at {conflict.origin}. Names are unique "
+                        "case-insensitively, and later files may not redefine them.",
+                        here,
+                    )
+                )
+                continue
+
+            if not isinstance(body, dict):
+                self._errors.append(
+                    ConfigError(f"{namespace.value} {name!r} must be an object", here)
+                )
+                continue
+
+            self._registry.register(name=name, namespace=namespace, origin=str(here))
+            draft = _Draft(name=name, body=body, origin=here)
+            if namespace is Namespace.INSTANCE:
+                self._instance_drafts.append(draft)
+            else:
+                self._rule_drafts.append(draft)
 
     # -- instances ------------------------------------------------------------
 
