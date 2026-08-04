@@ -446,6 +446,71 @@ class _Loader:
                 instances[instance.name] = instance
         return instances
 
+    def _build_instance(self, draft: _Draft) -> InstanceConfig | None:
+        self._reject_unknown_keys(
+            body=draft.body,
+            where=draft.origin,
+            allowed=_INSTANCE_KEYS,
+            subject=f"instance {draft.name!r}",
+        )
+
+        plugin_name = self._require_string(
+            body=draft.body, where=draft.origin, key="plugin", subject=f"instance {draft.name!r}"
+        )
+        if plugin_name is None:
+            return None
+
+        known = self._known_plugins.get(plugin_name)
+        if known is None:
+            available = ", ".join(sorted(self._known_plugins)) or "(none loaded)"
+            self._errors.append(
+                ConfigError(
+                    f"instance {draft.name!r} refers to unknown plugin {plugin_name!r}. "
+                    f"Plugins that loaded: {available}",
+                    draft.origin.key("plugin"),
+                )
+            )
+            return None
+
+        enabled = self._optional_bool(
+            body=draft.body,
+            where=draft.origin,
+            key="enabled",
+            default=True,
+            subject=f"instance {draft.name!r}",
+        )
+
+        settings = self._build_settings(draft=draft, known=known)
+        if settings is None:
+            return None
+
+        return InstanceConfig(
+            name=draft.name,
+            plugin=plugin_name,
+            directions=known.directions,
+            settings=settings,
+            enabled=enabled,
+            origin=draft.origin,
+        )
+
+    def _build_settings(self, *, draft: _Draft, known: KnownPlugin) -> Mapping[str, object] | None:
+        where = draft.origin.key("config")
+        if "config" not in draft.body:
+            settings: Mapping[str, object] = {}
+        elif isinstance(draft.body["config"], dict):
+            settings = self._resolve_secrets_object(draft.body["config"], where)
+        else:
+            self._errors.append(
+                ConfigError(f'instance {draft.name!r}: "config" must be an object', where)
+            )
+            return None
+
+        if known.validate_settings is not None:
+            for problem in known.validate_settings(settings):
+                self._errors.append(ConfigError(f"instance {draft.name!r}: {problem}", where))
+
+        return settings
+
     # -- rules ----------------------------------------------------------------
 
     def _build_rules(self, instances: Mapping[str, InstanceConfig]) -> dict[str, RuleConfig]:
@@ -455,3 +520,54 @@ class _Loader:
             if rule is not None:
                 rules[rule.name] = rule
         return rules
+
+    # -- shared field helpers -------------------------------------------------
+
+    def _reject_unknown_keys(
+        self,
+        *,
+        body: Mapping[str, object],
+        where: ConfigPath,
+        allowed: tuple[str, ...],
+        subject: str,
+    ) -> None:
+        for key in body:
+            if key not in allowed:
+                self._errors.append(
+                    ConfigError(
+                        f"{subject}: unknown key {key!r}; expected one of "
+                        f"{', '.join(repr(name) for name in allowed)}",
+                        where.key(key),
+                    )
+                )
+
+    def _require_string(
+        self, *, body: Mapping[str, object], where: ConfigPath, key: str, subject: str
+    ) -> str | None:
+        if key not in body:
+            self._errors.append(ConfigError(f'{subject} has no "{key}"', where))
+            return None
+        value = body[key]
+        if not isinstance(value, str):
+            self._errors.append(ConfigError(f'{subject}: "{key}" must be a string', where.key(key)))
+            return None
+        return value
+
+    def _optional_bool(
+        self,
+        *,
+        body: Mapping[str, object],
+        where: ConfigPath,
+        key: str,
+        default: bool,
+        subject: str,
+    ) -> bool:
+        if key not in body:
+            return default
+        value = body[key]
+        if not isinstance(value, bool):
+            self._errors.append(
+                ConfigError(f'{subject}: "{key}" must be true or false', where.key(key))
+            )
+            return default
+        return value
