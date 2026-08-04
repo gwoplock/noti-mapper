@@ -15,6 +15,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from noti_mapper.secrets import SecretStore
+
 DEFAULT_CONFIG_DIRECTORY: Path = Path("/etc/noti-mapper.d")
 
 _TOP_LEVEL_KEYS = ("daemon", "instances", "rules")
@@ -132,3 +134,68 @@ class Configuration:
             if rule.enabled:
                 result.append(rule)
         return sorted(result, key=lambda rule: rule.name)
+
+
+@dataclass(frozen=True)
+class ConfigError:
+    """One problem with the configuration, and where in the tree it is."""
+
+    message: str
+    where: ConfigPath | None = None
+
+    def __str__(self) -> str:
+        if self.where is None:
+            return self.message
+        return f"{self.where}:\n      {self.message}"
+
+
+class ConfigurationError(Exception):
+    """The configuration is unusable. Carries every problem found, not just the first."""
+
+    def __init__(self, errors: list[ConfigError]) -> None:
+        self.errors = _sorted_errors(errors)
+        joined = "\n".join(f"  {error}" for error in self.errors)
+        count = len(self.errors)
+        noun = "error" if count == 1 else "errors"
+        super().__init__(f"{count} configuration {noun}:\n{joined}")
+
+
+def _sorted_errors(errors: list[ConfigError]) -> list[ConfigError]:
+    def key(error: ConfigError) -> tuple[int, str, tuple[str, ...]]:
+        if error.where is None:
+            return (1, "", ())
+        return (0, str(error.where.file), error.where.steps)
+
+    return sorted(errors, key=key)
+
+
+def discover_config_files(directory: Path) -> list[Path]:
+    """Return the ``*.json`` files in ``directory``, in lexical order."""
+    return sorted(directory.glob("*.json"))
+
+
+def load_configuration(
+    *,
+    config_directory: Path,
+    secrets: SecretStore,
+    known_plugins: Mapping[str, KnownPlugin],
+) -> Configuration:
+    """Load, merge, and validate the configuration.
+
+    Raises :class:`ConfigurationError` carrying every problem found.
+    """
+    loader = _Loader(
+        config_directory=config_directory,
+        secrets=secrets,
+        known_plugins=known_plugins,
+    )
+    return loader.load()
+
+
+@dataclass
+class _Draft:
+    """A named object collected from a file, not yet checked."""
+
+    name: str
+    body: Mapping[str, object]
+    origin: ConfigPath
