@@ -50,7 +50,7 @@ def test_mode_0400_is_accepted(tmp_path: Path) -> None:
 
 def test_non_object_secrets_file_is_refused(tmp_path: Path) -> None:
     path = _write_secrets(tmp_path, ["a", "b"])
-    with pytest.raises(SecretsError, match="must contain a JSON object"):
+    with pytest.raises(SecretsError, match="top level must be an object"):
         load_secrets(path)
 
 
@@ -64,7 +64,7 @@ def test_malformed_secrets_file_is_refused(tmp_path: Path) -> None:
     path = tmp_path / "secrets.json"
     path.write_text("{not json", encoding="utf-8")
     path.chmod(0o600)
-    with pytest.raises(SecretsError, match="not valid JSON"):
+    with pytest.raises(SecretsError, match="line 1"):
         load_secrets(path)
 
 

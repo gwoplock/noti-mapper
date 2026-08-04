@@ -209,7 +209,7 @@ def test_redefining_a_name_in_a_later_file_is_an_error(tmp_path: Path) -> None:
     errors = _errors(tmp_path)
     assert len(errors) == 1
     assert "duplicate instance name 'Porch Mail'" in errors[0]
-    assert "10-a.json:3:5" in errors[0]
+    assert "10-a.json: instances → 'Porch Mail'" in errors[0]
     assert "20-b.json" in errors[0]
 
 
@@ -243,10 +243,43 @@ def test_an_empty_config_directory_is_an_error(tmp_path: Path) -> None:
 # -- structural validation ----------------------------------------------------
 
 
-def test_malformed_json_reports_file_and_line(tmp_path: Path) -> None:
+def test_malformed_json_reports_the_file_and_the_position(tmp_path: Path) -> None:
+    """The standard library gives a position for syntax errors, so it is passed on."""
     tmp_path.joinpath("bad.json").write_text('{\n  "instances": {,\n}\n', encoding="utf-8")
     errors = _errors(tmp_path)
-    assert "bad.json:2:17" in errors[0]
+    assert "bad.json" in errors[0]
+    assert "line 2" in errors[0]
+
+
+def test_duplicate_keys_in_one_object_are_an_error(tmp_path: Path) -> None:
+    tmp_path.joinpath("dup.json").write_text('{"instances": {}, "instances": {}}', encoding="utf-8")
+    errors = _errors(tmp_path)
+    assert "duplicate key 'instances'" in errors[0]
+
+
+def test_nan_and_infinity_are_rejected(tmp_path: Path) -> None:
+    tmp_path.joinpath("nan.json").write_text('{"daemon": {"retry_max_seconds": NaN}}', "utf-8")
+    errors = _errors(tmp_path)
+    assert "NaN is not valid JSON" in errors[0]
+
+
+def test_errors_name_the_path_through_the_document(tmp_path: Path) -> None:
+    _write(tmp_path, "a.json", {"instances": {"Porch Mail": {"plugin": "nope"}}})
+    errors = _errors(tmp_path)
+    assert "instances → 'Porch Mail' → plugin" in errors[0]
+
+
+def test_array_elements_are_subscripted_in_the_path(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "a.json",
+        {
+            "instances": {"Out": {"plugin": "homekit-output"}},
+            "rules": {"R": {"inputs": ["Nope"], "outputs": ["Out"]}},
+        },
+    )
+    errors = _errors(tmp_path)
+    assert "rules → 'R' → inputs[0]" in errors[0]
 
 
 def test_one_bad_file_does_not_hide_errors_in_another(tmp_path: Path) -> None:

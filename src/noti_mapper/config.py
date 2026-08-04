@@ -4,25 +4,18 @@ Configuration is a set of JSON files in ``/etc/noti-mapper.d/``, read in
 lexical order and merged. Later files may add instances and rules; redefining
 a name that an earlier file already defined is an error, not an override.
 
-Validation reports every problem in one pass, each with a file and a line.
-Failing on the first error and making the user fix them one restart at a time
-is the behaviour this is written to avoid.
+Validation reports every problem in one pass, each with the file it is in and
+the path through that file to the thing that is wrong. Failing on the first
+error and making the user fix them one restart at a time is the behaviour this
+is written to avoid.
 """
 
 import enum
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from noti_mapper.jsonloc import (
-    JsonArray,
-    JsonNode,
-    JsonObject,
-    JsonParseError,
-    JsonScalar,
-    Location,
-    parse_file,
-)
+from noti_mapper.jsonfile import JsonFileError, read_object
 from noti_mapper.names import (
     NameRegistry,
     Namespace,
@@ -42,6 +35,43 @@ _DAEMON_KEYS = (
     "retry_initial_seconds",
     "retry_max_seconds",
 )
+
+
+@dataclass(frozen=True)
+class ConfigPath:
+    """Where in a configuration file something is.
+
+    A path through the document rather than a line and column. ``json.loads``
+    reports a position for a syntax error and for nothing else, and recovering
+    per-value positions means maintaining a second parser in step with the
+    first one forever.
+
+    ``instances -> 'Porch Mail' -> plugin`` tells a reader where to look
+    without any of that, and unlike a line number it survives the file being
+    reformatted.
+    """
+
+    file: Path
+    steps: tuple[str, ...] = ()
+
+    def key(self, name: str) -> "ConfigPath":
+        """Descend into a schema key, spelled the way the schema spells it."""
+        return ConfigPath(file=self.file, steps=(*self.steps, name))
+
+    def named(self, value: str) -> "ConfigPath":
+        """Descend into a user-chosen name, quoted so it stands out from schema."""
+        return ConfigPath(file=self.file, steps=(*self.steps, repr(value)))
+
+    def element(self, index: int) -> "ConfigPath":
+        """Descend into an array element, subscripting the step above it."""
+        if not self.steps:
+            return ConfigPath(file=self.file, steps=(f"[{index}]",))
+        return ConfigPath(file=self.file, steps=(*self.steps[:-1], f"{self.steps[-1]}[{index}]"))
+
+    def __str__(self) -> str:
+        if not self.steps:
+            return str(self.file)
+        return f"{self.file}: " + " → ".join(self.steps)
 
 
 class PluginDirection(enum.Enum):
@@ -75,7 +105,7 @@ class InstanceConfig:
     directions: frozenset[PluginDirection]
     settings: Mapping[str, object]
     enabled: bool
-    origin: Location
+    origin: ConfigPath
 
     def is_input(self) -> bool:
         return PluginDirection.INPUT in self.directions
@@ -92,7 +122,7 @@ class RuleConfig:
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
     enabled: bool
-    origin: Location
+    origin: ConfigPath
 
 
 @dataclass(frozen=True)
@@ -137,15 +167,15 @@ class Configuration:
 
 @dataclass(frozen=True)
 class ConfigError:
-    """One problem with the configuration, and where it is."""
+    """One problem with the configuration, and where in the tree it is."""
 
     message: str
-    location: Location | None = None
+    where: ConfigPath | None = None
 
     def __str__(self) -> str:
-        if self.location is None:
+        if self.where is None:
             return self.message
-        return f"{self.location}: {self.message}"
+        return f"{self.where}:\n      {self.message}"
 
 
 class ConfigurationError(Exception):
@@ -160,10 +190,10 @@ class ConfigurationError(Exception):
 
 
 def _sorted_errors(errors: list[ConfigError]) -> list[ConfigError]:
-    def key(error: ConfigError) -> tuple[int, str, int, int]:
-        if error.location is None:
-            return (1, "", 0, 0)
-        return (0, str(error.location.path), error.location.line, error.location.column)
+    def key(error: ConfigError) -> tuple[int, str, tuple[str, ...]]:
+        if error.where is None:
+            return (1, "", ())
+        return (0, str(error.where.file), error.where.steps)
 
     return sorted(errors, key=key)
 
@@ -192,17 +222,12 @@ def load_configuration(
 
 
 @dataclass
-class _InstanceDraft:
-    name: str
-    node: JsonObject
-    origin: Location
+class _Draft:
+    """A named object collected from a file, not yet checked."""
 
-
-@dataclass
-class _RuleDraft:
     name: str
-    node: JsonObject
-    origin: Location
+    body: Mapping[str, object]
+    origin: ConfigPath
 
 
 class _Loader:
@@ -220,20 +245,21 @@ class _Loader:
         self._known_plugins = known_plugins
         self._errors: list[ConfigError] = []
         self._registry = NameRegistry()
-        self._instance_drafts: list[_InstanceDraft] = []
-        self._rule_drafts: list[_RuleDraft] = []
+        self._instance_drafts: list[_Draft] = []
+        self._rule_drafts: list[_Draft] = []
         # Instances that were declared but failed to build. A rule referencing
         # one of these should not also be told the instance does not exist --
         # that turns one mistake into two errors and hides the real one.
         self._broken_instances: set[str] = set()
-        self._daemon_node: JsonObject | None = None
+        self._daemon_body: Mapping[str, object] | None = None
+        self._daemon_origin: ConfigPath | None = None
 
     def load(self) -> Configuration:
         files = self._read_files()
         for path in files:
             document = self._parse(path)
             if document is not None:
-                self._collect_document(document=document)
+                self._collect_document(document=document, path=path)
 
         daemon = self._build_daemon()
         instances = self._build_instances()
@@ -259,119 +285,126 @@ class _Loader:
             )
         return files
 
-    def _parse(self, path: Path) -> JsonObject | None:
+    def _parse(self, path: Path) -> Mapping[str, object] | None:
         try:
-            document = parse_file(path)
-        except JsonParseError as error:
-            self._errors.append(ConfigError(error.message, error.location))
-            return None
-        except OSError as error:
-            self._errors.append(ConfigError(f"cannot read {path}: {error.strerror}"))
+            return read_object(path)
+        except JsonFileError as error:
+            self._errors.append(ConfigError(error.detail, ConfigPath(file=path)))
             return None
 
-        if not isinstance(document, JsonObject):
-            self._errors.append(
-                ConfigError(
-                    "the top level of a configuration file must be an object with "
-                    '"instances", "rules", and/or "daemon" keys',
-                    document.location,
-                )
-            )
-            return None
-        return document
-
-    def _collect_document(self, *, document: JsonObject) -> None:
-        for key, node in document.members.items():
-            location = document.key_locations[key]
+    def _collect_document(self, *, document: Mapping[str, object], path: Path) -> None:
+        root = ConfigPath(file=path)
+        for key, value in document.items():
+            where = root.key(key)
             if key not in _TOP_LEVEL_KEYS:
                 self._errors.append(
                     ConfigError(
                         f"unknown top-level key {key!r}; expected one of "
                         f"{', '.join(repr(name) for name in _TOP_LEVEL_KEYS)}",
-                        location,
+                        where,
                     )
                 )
                 continue
-            if not isinstance(node, JsonObject):
-                self._errors.append(ConfigError(f"{key!r} must be an object", node.location))
+            if not isinstance(value, dict):
+                self._errors.append(ConfigError(f"{key!r} must be an object", where))
                 continue
             if key == "daemon":
-                self._collect_daemon(node=node, location=location)
+                self._collect_daemon(body=value, where=where)
             elif key == "instances":
-                self._collect_named(container=node, namespace=Namespace.INSTANCE)
+                self._collect_named(container=value, namespace=Namespace.INSTANCE, where=where)
             else:
-                self._collect_named(container=node, namespace=Namespace.RULE)
+                self._collect_named(container=value, namespace=Namespace.RULE, where=where)
 
-    def _collect_daemon(self, *, node: JsonObject, location: Location) -> None:
-        if self._daemon_node is not None:
+    def _collect_daemon(self, *, body: Mapping[str, object], where: ConfigPath) -> None:
+        if self._daemon_origin is not None:
             self._errors.append(
                 ConfigError(
-                    'a second "daemon" block; it is already defined at '
-                    f"{self._daemon_node.location}. Daemon-wide settings live in "
+                    'a second "daemon" block; it is already defined in '
+                    f"{self._daemon_origin.file}. Daemon-wide settings live in "
                     "exactly one file.",
-                    location,
+                    where,
                 )
             )
             return
-        self._daemon_node = node
+        self._daemon_body = body
+        self._daemon_origin = where
 
     # -- daemon-wide settings -------------------------------------------------
 
     def _build_daemon(self) -> DaemonSettings:
-        node = self._daemon_node
-        if node is None:
+        body = self._daemon_body
+        where = self._daemon_origin
+        if body is None or where is None:
             return DaemonSettings()
 
-        self._reject_unknown_keys(node=node, allowed=_DAEMON_KEYS, subject='"daemon"')
+        self._reject_unknown_keys(body=body, where=where, allowed=_DAEMON_KEYS, subject='"daemon"')
         defaults = DaemonSettings()
         return DaemonSettings(
             event_log_max_rows=self._positive_int(
-                node=node, key="event_log_max_rows", default=defaults.event_log_max_rows
+                body=body,
+                where=where,
+                key="event_log_max_rows",
+                default=defaults.event_log_max_rows,
             ),
             dispatcher_threads=self._positive_int(
-                node=node, key="dispatcher_threads", default=defaults.dispatcher_threads
+                body=body,
+                where=where,
+                key="dispatcher_threads",
+                default=defaults.dispatcher_threads,
             ),
             retry_initial_seconds=self._positive_number(
-                node=node, key="retry_initial_seconds", default=defaults.retry_initial_seconds
+                body=body,
+                where=where,
+                key="retry_initial_seconds",
+                default=defaults.retry_initial_seconds,
             ),
             retry_max_seconds=self._positive_number(
-                node=node, key="retry_max_seconds", default=defaults.retry_max_seconds
+                body=body,
+                where=where,
+                key="retry_max_seconds",
+                default=defaults.retry_max_seconds,
             ),
         )
 
-    def _positive_int(self, *, node: JsonObject, key: str, default: int) -> int:
-        member = node.members.get(key)
-        if member is None:
+    def _positive_int(
+        self, *, body: Mapping[str, object], where: ConfigPath, key: str, default: int
+    ) -> int:
+        if key not in body:
             return default
-        value = member.value if isinstance(member, JsonScalar) else None
+        value = body[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             self._errors.append(
-                ConfigError(f'"daemon": "{key}" must be a positive integer', member.location)
+                ConfigError(f'"daemon": "{key}" must be a positive integer', where.key(key))
             )
             return default
         return value
 
-    def _positive_number(self, *, node: JsonObject, key: str, default: float) -> float:
-        member = node.members.get(key)
-        if member is None:
+    def _positive_number(
+        self, *, body: Mapping[str, object], where: ConfigPath, key: str, default: float
+    ) -> float:
+        if key not in body:
             return default
-        value = member.value if isinstance(member, JsonScalar) else None
+        value = body[key]
         if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
             self._errors.append(
-                ConfigError(f'"daemon": "{key}" must be a positive number', member.location)
+                ConfigError(f'"daemon": "{key}" must be a positive number', where.key(key))
             )
             return default
         return float(value)
 
-    def _collect_named(self, *, container: JsonObject, namespace: Namespace) -> None:
-        for raw_name, node in container.members.items():
-            location = container.key_locations[raw_name]
+    # -- names ----------------------------------------------------------------
+
+    def _collect_named(
+        self, *, container: Mapping[str, object], namespace: Namespace, where: ConfigPath
+    ) -> None:
+        for raw_name, body in container.items():
+            here = where.named(raw_name)
 
             problems = find_name_problems(raw_name)
             if problems:
                 for problem in problems:
                     self._errors.append(
-                        ConfigError(f"{namespace.value} name {raw_name!r}: {problem}", location)
+                        ConfigError(f"{namespace.value} name {raw_name!r}: {problem}", here)
                     )
                 continue
 
@@ -383,22 +416,23 @@ class _Loader:
                         f"duplicate {namespace.value} name {name!r}; already defined as "
                         f"{conflict.name!r} at {conflict.origin}. Names are unique "
                         "case-insensitively, and later files may not redefine them.",
-                        location,
+                        here,
                     )
                 )
                 continue
 
-            if not isinstance(node, JsonObject):
+            if not isinstance(body, dict):
                 self._errors.append(
-                    ConfigError(f"{namespace.value} {name!r} must be an object", node.location)
+                    ConfigError(f"{namespace.value} {name!r} must be an object", here)
                 )
                 continue
 
-            self._registry.register(name=name, namespace=namespace, origin=str(location))
+            self._registry.register(name=name, namespace=namespace, origin=str(here))
+            draft = _Draft(name=name, body=body, origin=here)
             if namespace is Namespace.INSTANCE:
-                self._instance_drafts.append(_InstanceDraft(name=name, node=node, origin=location))
+                self._instance_drafts.append(draft)
             else:
-                self._rule_drafts.append(_RuleDraft(name=name, node=node, origin=location))
+                self._rule_drafts.append(draft)
 
     # -- instances ------------------------------------------------------------
 
@@ -412,13 +446,16 @@ class _Loader:
                 instances[instance.name] = instance
         return instances
 
-    def _build_instance(self, draft: _InstanceDraft) -> InstanceConfig | None:
+    def _build_instance(self, draft: _Draft) -> InstanceConfig | None:
         self._reject_unknown_keys(
-            node=draft.node, allowed=_INSTANCE_KEYS, subject=f"instance {draft.name!r}"
+            body=draft.body,
+            where=draft.origin,
+            allowed=_INSTANCE_KEYS,
+            subject=f"instance {draft.name!r}",
         )
 
         plugin_name = self._require_string(
-            node=draft.node, key="plugin", subject=f"instance {draft.name!r}"
+            body=draft.body, where=draft.origin, key="plugin", subject=f"instance {draft.name!r}"
         )
         if plugin_name is None:
             return None
@@ -430,13 +467,17 @@ class _Loader:
                 ConfigError(
                     f"instance {draft.name!r} refers to unknown plugin {plugin_name!r}. "
                     f"Plugins that loaded: {available}",
-                    draft.node.key_locations["plugin"],
+                    draft.origin.key("plugin"),
                 )
             )
             return None
 
         enabled = self._optional_bool(
-            node=draft.node, key="enabled", default=True, subject=f"instance {draft.name!r}"
+            body=draft.body,
+            where=draft.origin,
+            key="enabled",
+            default=True,
+            subject=f"instance {draft.name!r}",
         )
 
         settings = self._build_settings(draft=draft, known=known)
@@ -452,56 +493,52 @@ class _Loader:
             origin=draft.origin,
         )
 
-    def _build_settings(
-        self, *, draft: _InstanceDraft, known: KnownPlugin
-    ) -> Mapping[str, object] | None:
-        config_node = draft.node.members.get("config")
-        if config_node is None:
+    def _build_settings(self, *, draft: _Draft, known: KnownPlugin) -> Mapping[str, object] | None:
+        where = draft.origin.key("config")
+        if "config" not in draft.body:
             settings: Mapping[str, object] = {}
-        elif isinstance(config_node, JsonObject):
-            settings = self._resolve_secrets_object(config_node)
+        elif isinstance(draft.body["config"], dict):
+            settings = self._resolve_secrets_object(draft.body["config"], where)
         else:
             self._errors.append(
-                ConfigError(
-                    f'instance {draft.name!r}: "config" must be an object',
-                    config_node.location,
-                )
+                ConfigError(f'instance {draft.name!r}: "config" must be an object', where)
             )
             return None
 
         if known.validate_settings is not None:
-            location = draft.node.key_locations.get("config", draft.origin)
             for problem in known.validate_settings(settings):
-                self._errors.append(ConfigError(f"instance {draft.name!r}: {problem}", location))
+                self._errors.append(ConfigError(f"instance {draft.name!r}: {problem}", where))
 
         return settings
 
-    def _resolve_secrets_object(self, node: JsonObject) -> dict[str, object]:
+    def _resolve_secrets_object(
+        self, body: Mapping[str, object], where: ConfigPath
+    ) -> dict[str, object]:
         members: dict[str, object] = {}
-        for key, value in node.members.items():
-            members[key] = self._resolve_secrets(value)
+        for key, value in body.items():
+            members[key] = self._resolve_secrets(value, where.key(key))
         return members
 
-    def _resolve_secrets(self, node: JsonNode) -> object:
-        if isinstance(node, JsonScalar):
-            if not isinstance(node.value, str):
-                return node.value
-            result = substitute(text=node.value, store=self._secrets)
+    def _resolve_secrets(self, value: object, where: ConfigPath) -> object:
+        if isinstance(value, str):
+            result = substitute(text=value, store=self._secrets)
             for name in result.missing:
                 known = ", ".join(self._secrets.names()) or "(none defined)"
                 self._errors.append(
                     ConfigError(
                         f"undefined secret {name!r}; {self._secrets.path} defines: {known}",
-                        node.location,
+                        where,
                     )
                 )
             return result.text
-        if isinstance(node, JsonArray):
+        if isinstance(value, list):
             elements: list[object] = []
-            for element in node.elements:
-                elements.append(self._resolve_secrets(element))
+            for index, element in enumerate(value):
+                elements.append(self._resolve_secrets(element, where.element(index)))
             return elements
-        return self._resolve_secrets_object(node)
+        if isinstance(value, dict):
+            return self._resolve_secrets_object(value, where)
+        return value
 
     # -- rules ----------------------------------------------------------------
 
@@ -514,23 +551,20 @@ class _Loader:
         return rules
 
     def _build_rule(
-        self, *, draft: _RuleDraft, instances: Mapping[str, InstanceConfig]
+        self, *, draft: _Draft, instances: Mapping[str, InstanceConfig]
     ) -> RuleConfig | None:
         self._reject_unknown_keys(
-            node=draft.node, allowed=_RULE_KEYS, subject=f"rule {draft.name!r}"
+            body=draft.body,
+            where=draft.origin,
+            allowed=_RULE_KEYS,
+            subject=f"rule {draft.name!r}",
         )
 
         inputs = self._rule_members(
-            draft=draft,
-            key="inputs",
-            direction=PluginDirection.INPUT,
-            instances=instances,
+            draft=draft, key="inputs", direction=PluginDirection.INPUT, instances=instances
         )
         outputs = self._rule_members(
-            draft=draft,
-            key="outputs",
-            direction=PluginDirection.OUTPUT,
-            instances=instances,
+            draft=draft, key="outputs", direction=PluginDirection.OUTPUT, instances=instances
         )
         if inputs is None or outputs is None:
             return None
@@ -548,7 +582,11 @@ class _Loader:
             return None
 
         enabled = self._optional_bool(
-            node=draft.node, key="enabled", default=True, subject=f"rule {draft.name!r}"
+            body=draft.body,
+            where=draft.origin,
+            key="enabled",
+            default=True,
+            subject=f"rule {draft.name!r}",
         )
 
         return RuleConfig(
@@ -562,53 +600,65 @@ class _Loader:
     def _rule_members(
         self,
         *,
-        draft: _RuleDraft,
+        draft: _Draft,
         key: str,
         direction: PluginDirection,
         instances: Mapping[str, InstanceConfig],
     ) -> tuple[str, ...] | None:
-        node = draft.node.members.get(key)
-        if node is None:
+        where = draft.origin.key(key)
+        if key not in draft.body:
             self._errors.append(ConfigError(f'rule {draft.name!r} has no "{key}"', draft.origin))
             return None
-        if not isinstance(node, JsonArray):
+
+        listed = draft.body[key]
+        if not isinstance(listed, list):
             self._errors.append(
                 ConfigError(
-                    f'rule {draft.name!r}: "{key}" must be an array of instance names',
-                    node.location,
+                    f'rule {draft.name!r}: "{key}" must be an array of instance names', where
                 )
             )
             return None
-        if not node.elements:
+        if not listed:
             self._errors.append(
                 ConfigError(
                     f'rule {draft.name!r}: "{key}" is empty; a rule with no {key} can '
                     "never do anything",
-                    node.location,
+                    where,
                 )
             )
             return None
 
+        return self._resolve_members(
+            draft=draft, key=key, direction=direction, listed=listed, instances=instances
+        )
+
+    def _resolve_members(
+        self,
+        *,
+        draft: _Draft,
+        key: str,
+        direction: PluginDirection,
+        listed: Sequence[object],
+        instances: Mapping[str, InstanceConfig],
+    ) -> tuple[str, ...] | None:
         names: list[str] = []
         ok = True
-        for element in node.elements:
-            if not isinstance(element, JsonScalar) or not isinstance(element.value, str):
+
+        for index, element in enumerate(listed):
+            here = draft.origin.key(key).element(index)
+            if not isinstance(element, str):
                 self._errors.append(
                     ConfigError(
-                        f'rule {draft.name!r}: "{key}" entries must be instance names',
-                        element.location,
+                        f'rule {draft.name!r}: "{key}" entries must be instance names', here
                     )
                 )
                 ok = False
                 continue
 
-            name = normalize_name(element.value)
+            name = normalize_name(element)
             if name in names:
                 self._errors.append(
-                    ConfigError(
-                        f'rule {draft.name!r}: {name!r} is listed twice in "{key}"',
-                        element.location,
-                    )
+                    ConfigError(f'rule {draft.name!r}: {name!r} is listed twice in "{key}"', here)
                 )
                 ok = False
                 continue
@@ -620,7 +670,7 @@ class _Loader:
                         ConfigError(
                             f"rule {draft.name!r} references unknown instance {name!r}"
                             + self._suggestion_for(name),
-                            element.location,
+                            here,
                         )
                     )
                 ok = False
@@ -632,7 +682,7 @@ class _Loader:
                     ConfigError(
                         f'rule {draft.name!r} lists {name!r} under "{key}", but plugin '
                         f"{instance.plugin!r} provides only: {actual}",
-                        element.location,
+                        here,
                     )
                 )
                 ok = False
@@ -654,37 +704,50 @@ class _Loader:
     # -- shared field helpers -------------------------------------------------
 
     def _reject_unknown_keys(
-        self, *, node: JsonObject, allowed: tuple[str, ...], subject: str
+        self,
+        *,
+        body: Mapping[str, object],
+        where: ConfigPath,
+        allowed: tuple[str, ...],
+        subject: str,
     ) -> None:
-        for key in node.members:
+        for key in body:
             if key not in allowed:
                 self._errors.append(
                     ConfigError(
                         f"{subject}: unknown key {key!r}; expected one of "
                         f"{', '.join(repr(name) for name in allowed)}",
-                        node.key_locations[key],
+                        where.key(key),
                     )
                 )
 
-    def _require_string(self, *, node: JsonObject, key: str, subject: str) -> str | None:
-        member = node.members.get(key)
-        if member is None:
-            self._errors.append(ConfigError(f'{subject} has no "{key}"', node.location))
+    def _require_string(
+        self, *, body: Mapping[str, object], where: ConfigPath, key: str, subject: str
+    ) -> str | None:
+        if key not in body:
+            self._errors.append(ConfigError(f'{subject} has no "{key}"', where))
             return None
-        if not isinstance(member, JsonScalar) or not isinstance(member.value, str):
-            self._errors.append(
-                ConfigError(f'{subject}: "{key}" must be a string', member.location)
-            )
+        value = body[key]
+        if not isinstance(value, str):
+            self._errors.append(ConfigError(f'{subject}: "{key}" must be a string', where.key(key)))
             return None
-        return member.value
+        return value
 
-    def _optional_bool(self, *, node: JsonObject, key: str, default: bool, subject: str) -> bool:
-        member = node.members.get(key)
-        if member is None:
+    def _optional_bool(
+        self,
+        *,
+        body: Mapping[str, object],
+        where: ConfigPath,
+        key: str,
+        default: bool,
+        subject: str,
+    ) -> bool:
+        if key not in body:
             return default
-        if not isinstance(member, JsonScalar) or not isinstance(member.value, bool):
+        value = body[key]
+        if not isinstance(value, bool):
             self._errors.append(
-                ConfigError(f'{subject}: "{key}" must be true or false', member.location)
+                ConfigError(f'{subject}: "{key}" must be true or false', where.key(key))
             )
             return default
-        return member.value
+        return value

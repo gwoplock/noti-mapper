@@ -14,7 +14,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from noti_mapper.jsonloc import JsonObject, JsonParseError, JsonScalar, parse_file
+from noti_mapper.jsonfile import JsonFileError, read_object
 
 DEFAULT_SECRETS_PATH: Path = Path("/etc/noti-mapper/secrets.json")
 
@@ -66,22 +66,19 @@ def load_secrets(path: Path) -> SecretStore:
         )
 
     try:
-        document = parse_file(path)
-    except JsonParseError as error:
-        raise SecretsError(f"{path} is not valid JSON: {error.message}") from error
-
-    if not isinstance(document, JsonObject):
-        raise SecretsError(f"{path} must contain a JSON object mapping secret names to strings")
+        document = read_object(path)
+    except JsonFileError as error:
+        raise SecretsError(f"{error}") from error
 
     values: dict[str, str] = {}
-    for name, node in document.members.items():
+    for name, value in document.items():
         if SECRET_NAME_PATTERN.fullmatch(name) is None:
             raise SecretsError(
-                f"{path}: secret name {name!r} contains characters outside " "[A-Za-z0-9_.-]"
+                f"{path}: secret name {name!r} contains characters outside [A-Za-z0-9_.-]"
             )
-        if not isinstance(node, JsonScalar) or not isinstance(node.value, str):
+        if not isinstance(value, str):
             raise SecretsError(f"{path}: secret {name!r} must be a string")
-        values[name] = node.value
+        values[name] = value
 
     return SecretStore(path=path, values=values)
 
