@@ -25,6 +25,9 @@ dependencies = []
 # plugins. Packaging declares these as system packages instead; see
 # packaging/aur/. Nothing in src/noti_mapper imports them.
 plugins = ["imapclient>=3.0", "HAP-python>=4.9"]
+# The behaviour suite. It drives the installed binary rather than importing
+# anything, so it is not needed to run the unit tests.
+bdd = ["behave>=1.2.6"]
 
 [project.scripts]
 noti-mapper = "noti_mapper.cli:main"
@@ -71,6 +74,18 @@ mypy_path = "src"
 files = ["src", "tests", "plugins"]
 
 [[tool.mypy.overrides]]
+# behave ships no type information.
+module = ["behave.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Step definitions are bound to Gherkin by behave's decorators, which are
+# untyped. Everything the steps themselves declare is still checked; only the
+# decorator's opinion of the function is allowed to be Any.
+module = ["tests.features.*"]
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
 # Third-party plugin libraries ship no type information.
 module = ["imapclient.*", "pyhap.*"]
 ignore_missing_imports = true
@@ -85,5 +100,7 @@ disallow_subclassing_any = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# behave owns tests/features; pytest must not try to collect the .feature files.
+norecursedirs = ["tests/features"]
 pythonpath = ["src", "plugins", "."]
 filterwarnings = ["error"]
