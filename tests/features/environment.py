@@ -50,4 +50,18 @@ def after_scenario(context: Any, scenario: Any) -> None:
 
     workspace = getattr(context, "workspace", None)
     if workspace is not None:
-        shutil.rmtree(workspace, ignore_errors=True)
+        _remove_workspace(workspace)
+
+
+def _remove_workspace(workspace: Path) -> None:
+    """Delete a scenario's scratch directory, having checked it is one.
+
+    rmtree takes whatever it is given. The path always comes from mkdtemp, so
+    this can never fire -- which is the point of asserting it rather than
+    trusting that it stays true.
+    """
+    root = Path(tempfile.gettempdir()).resolve()
+    resolved = workspace.resolve()
+    if not resolved.is_relative_to(root) or not resolved.name.startswith("noti-bdd-"):
+        raise AssertionError(f"refusing to delete {resolved}, which is not a scenario workspace")
+    shutil.rmtree(resolved, ignore_errors=True)
