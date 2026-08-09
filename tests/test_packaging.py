@@ -313,3 +313,60 @@ def test_the_non_goals_are_written_down_where_people_will_look() -> None:
     assert "Non-goals" in readme
     for goal in ("web UI", "auto-clearing", "schedules"):
         assert goal in readme
+
+
+# -- the container ------------------------------------------------------------
+
+COMPOSE = REPOSITORY_ROOT / "docker" / "docker-compose.yml"
+DOCKERFILE = REPOSITORY_ROOT / "docker" / "Dockerfile"
+
+
+def test_every_compose_variable_refuses_to_default() -> None:
+    """An unset variable must abort, never expand to nothing.
+
+    Docker creates a missing bind-mount source as a root-owned directory. An
+    unguarded ${WORKSPACE}/state would therefore make /state at the filesystem
+    root of whoever ran it. Guarding only the first expansion and relying on it
+    to abort first makes that a property of evaluation order, which is not
+    something to trust.
+    """
+    text = COMPOSE.read_text(encoding="utf-8")
+    unguarded = [
+        expansion for expansion in re.findall(r"\$\{[^}]*\}", text) if ":?" not in expansion
+    ]
+    assert unguarded == [], f"these would silently expand to nothing: {unguarded}"
+
+
+def test_no_bind_mount_escapes_the_workspace() -> None:
+    """Every host path the container sees is under the scenario workspace."""
+    sources: list[str] = []
+    for line in COMPOSE.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("- ") or ":/" not in stripped:
+            continue
+        # The guard text contains spaces, so split on the container side.
+        sources.append(stripped[2:].split(":/", 1)[0])
+    assert sources, "expected the compose file to declare bind mounts"
+    for source in sources:
+        assert source.startswith(
+            "${NOTI_BDD_WORKSPACE"
+        ), f"bind mount source {source!r} is not inside the scenario workspace"
+
+
+def test_the_dockerfile_deletes_nothing_by_variable() -> None:
+    """A destructive command may not take a path from a variable.
+
+    rm -rf "$SOMETHING" with SOMETHING unset is how a build wipes a home
+    directory. Inside a container that is survivable; the habit is not.
+    """
+    for line in DOCKERFILE.read_text(encoding="utf-8").splitlines():
+        if "rm -rf" not in line and "rm -f" not in line:
+            continue
+        assert "$" not in line, f"destructive command interpolates a variable: {line.strip()}"
+
+
+def test_the_build_context_excludes_the_virtualenv() -> None:
+    """The venv holds host-specific absolute paths and has no business in an image."""
+    ignored = (REPOSITORY_ROOT / ".dockerignore").read_text(encoding="utf-8")
+    for entry in (".venv/", ".git/"):
+        assert entry in ignored, f"{entry} should not be sent to the docker daemon"

@@ -1,0 +1,15 @@
+# The build context is the whole repository; without this it would ship the
+# virtualenv (hundreds of megabytes of host-specific absolute paths) and the
+# entire git history to the daemon.
+.venv/
+.git/
+_build/
+build/
+dist/*.whl
+*.egg-info/
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
