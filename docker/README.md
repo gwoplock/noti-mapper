@@ -35,24 +35,32 @@ in the image to stand in for the last of those.
 
 ## What it touches on your machine
 
-Worth knowing before the first build, because none of it has been run:
-
-- **Bind mounts** — four, all under the scenario's `mkdtemp` workspace, and
-  every one guarded with `:?` so an unset variable aborts rather than
-  expanding to nothing. That matters: Docker creates a missing bind-mount
-  source as a *root-owned* directory, so an unguarded `${WORKSPACE}/state`
-  would make `/state` at your filesystem root.
-- **A host port** — 9736, published so the suite can POST webhooks.
+- **Nothing on your filesystem.** There are no bind mounts and no volumes. The
+  image carries the code and a default configuration, and a scenario reshapes
+  that configuration by writing *into the running container* with
+  `docker compose exec`. There is no host path for it to write to, which is a
+  stronger guarantee than guarding one.
+- **One port** — 9736, bound to `127.0.0.1` only, so the suite can POST
+  webhooks. Not reachable from your network.
 - **`host.docker.internal`** — the container needs a route back to the
-  PagerDuty stub, which runs in the behave process. The stub binds `0.0.0.0`
-  for the length of a scenario, so it is reachable from your LAN while a run
-  is in progress.
-- **Nothing else.** The image writes only inside itself, the compose file
-  declares no named volumes, and nothing in the Dockerfile passes a variable
-  to a destructive command.
+  PagerDuty stub, which runs in the behave process. Outbound HTTP, and the
+  only thing that crosses the boundary. The stub binds `0.0.0.0` for the
+  length of a scenario so the container can reach it.
 
-`tests/test_packaging.py` asserts the first and last of those, so they cannot
-regress without a test failing.
+`tests/test_packaging.py` asserts the first two, so neither can regress
+without a test failing.
+
+## What the application itself deletes
+
+Nothing on your filesystem, ever. There is not one call to `unlink`, `rmtree`,
+`remove`, `rename`, or `move` anywhere in `src/` or `plugins/`. The file
+watcher only ever calls `stat()` and `iterdir()` on what it watches, and the
+IMAP reader opens the mailbox read-only.
+
+Every deletion it performs is SQL, inside its own database at
+`/var/lib/noti-mapper/state.db`: trimming the rolling event log, dropping a
+rule's edges when configuration changes them, clearing a pending push once it
+lands, and `purge`, which only runs when an operator asks for it by name.
 
 ## Caveat
 

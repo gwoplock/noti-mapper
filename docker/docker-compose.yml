@@ -1,8 +1,9 @@
 # The daemon under test, driven by tests/features with NOTI_BDD_BACKEND=docker.
 #
-# The workspace is bind-mounted so the behave process writes configuration and
-# drops watched files on one side of the boundary and the daemon reads them on
-# the other, exactly as the local backend does.
+# Nothing from the host is mounted. The image carries the code and a default
+# configuration; a scenario reshapes that configuration by writing into the
+# running container with `docker compose exec`. There is therefore no host
+# path this can write to, and nothing it can delete.
 
 services:
   noti-mapper:
@@ -11,26 +12,19 @@ services:
       dockerfile: docker/Dockerfile
     image: noti-mapper:test
     # The PagerDuty stub runs in the behave process on the host, so the daemon
-    # needs a route back out. Nothing else leaves this container.
+    # needs a route back out. This is the only thing that crosses the
+    # boundary, and it is outbound HTTP.
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    # Every one of these is guarded, not just the first. Docker creates a
-    # missing bind-mount source as a root-owned directory, so an unset or
-    # empty variable here would silently make /state and /watched at the
-    # filesystem root. Relying on an earlier line to abort first makes a
-    # safety property depend on evaluation order.
-    volumes:
-      - ${NOTI_BDD_WORKSPACE:?refusing to start without a workspace path}/conf.d:/etc/noti-mapper.d:ro
-      - ${NOTI_BDD_WORKSPACE:?refusing to start without a workspace path}/secrets.json:/etc/noti-mapper/secrets.json:ro
-      - ${NOTI_BDD_WORKSPACE:?refusing to start without a workspace path}/state:/var/lib/noti-mapper
-      - ${NOTI_BDD_WORKSPACE:?refusing to start without a workspace path}/watched:/workspace/watched
     ports:
-      - "9736:9736"
+      # Loopback only. The webhook input is a test fixture, not something to
+      # put on the network.
+      - "127.0.0.1:9736:9736"
     command: ["run", "--log-level", "info"]
     healthcheck:
       # Readiness is the webhook socket accepting, which the daemon only opens
       # after configuration has validated and reconciliation has finished.
-      test: ["CMD-SHELL", "python -c \"import socket,sys; s=socket.socket(); sys.exit(s.connect_ex(('127.0.0.1',9736)))\""]
+      test: ["CMD-SHELL", "python -c \"import socket,sys; s=socket.socket(); sys.exit(s.connect_ex((\'127.0.0.1\',9736)))\""]
       interval: 2s
       timeout: 3s
       retries: 30

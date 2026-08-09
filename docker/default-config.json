@@ -1,0 +1,23 @@
+{
+  "instances": {
+    "Porch Hook": {
+      "plugin": "webhook-input",
+      "config": {
+        "secret": "a-secret-of-adequate-length",
+        "port": 9736,
+        "bind": "0.0.0.0",
+        "path": "/hook"
+      }
+    },
+    "Porch Files": {
+      "plugin": "file-input",
+      "config": {
+        "path": "/var/lib/noti-mapper/watched",
+        "glob": "*.txt",
+        "poll_seconds": 0.2,
+        "debounce_seconds": 0.4
+      }
+    }
+  },
+  "rules": {}
+}
