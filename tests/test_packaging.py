@@ -337,20 +337,33 @@ def test_every_compose_variable_refuses_to_default() -> None:
     assert unguarded == [], f"these would silently expand to nothing: {unguarded}"
 
 
-def test_no_bind_mount_escapes_the_workspace() -> None:
-    """Every host path the container sees is under the scenario workspace."""
-    sources: list[str] = []
-    for line in COMPOSE.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("- ") or ":/" not in stripped:
-            continue
-        # The guard text contains spaces, so split on the container side.
-        sources.append(stripped[2:].split(":/", 1)[0])
-    assert sources, "expected the compose file to declare bind mounts"
-    for source in sources:
-        assert source.startswith(
-            "${NOTI_BDD_WORKSPACE"
-        ), f"bind mount source {source!r} is not inside the scenario workspace"
+def test_the_container_mounts_nothing_from_the_host() -> None:
+    """The strongest version of "it cannot damage anything": it cannot reach it.
+
+    A bind mount is the only way this compose file could touch the host
+    filesystem. There are none, so a scenario reshapes the daemon's
+    configuration by writing into the running container instead. Docker also
+    creates a missing bind-mount source as a root-owned directory, which is
+    the failure mode this rules out entirely rather than guards against.
+    """
+    text = COMPOSE.read_text(encoding="utf-8")
+    mounts = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith("- ") and ":/" in line and "CMD" not in line
+    ]
+    assert mounts == [], f"the container should mount nothing, but declares: {mounts}"
+    assert "volumes:" not in text, "no volumes section should exist at all"
+
+
+def test_the_published_port_is_loopback_only() -> None:
+    """The webhook input is a test fixture, not something to put on the network."""
+    text = COMPOSE.read_text(encoding="utf-8")
+    published = re.findall(r'^\s+- "([^"]+)"', text, re.MULTILINE)
+    ports = [entry for entry in published if entry.count(":") >= 1 and "host-gateway" not in entry]
+    assert ports, "expected the webhook port to be published"
+    for entry in ports:
+        assert entry.startswith("127.0.0.1:"), f"port {entry!r} is not bound to loopback"
 
 
 def test_the_dockerfile_deletes_nothing_by_variable() -> None:

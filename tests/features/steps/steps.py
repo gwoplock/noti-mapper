@@ -56,17 +56,15 @@ def _drop_default(context: Any, rule: str) -> None:
 
 @given('the instance "{instance}" uses plugin "{plugin}"')
 def step_break_plugin(context: Any, instance: str, plugin: str) -> None:
-    path = context.daemon.config_directory / "10-instances.json"
-    document = json.loads(path.read_text(encoding="utf-8"))
+    document = json.loads(context.daemon.read_config("10-instances.json"))
     document["instances"][instance]["plugin"] = plugin
-    path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+    context.daemon.write_config("10-instances.json", json.dumps(document, indent=2))
 
 
 @when('the rule "{rule}" is removed from the configuration')
 def step_remove_rule(context: Any, rule: str) -> None:
     context.rules.pop(rule, None)
-    path = context.daemon.config_directory / "20-rules.json"
-    path.write_text(json.dumps({"rules": context.rules}, indent=2), encoding="utf-8")
+    context.daemon.write_config("20-rules.json", json.dumps({"rules": context.rules}, indent=2))
 
 
 # -- the daemon ---------------------------------------------------------------

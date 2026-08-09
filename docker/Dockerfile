@@ -76,8 +76,23 @@ COPY --from=build /usr/lib/python3*/site-packages/pyhap /usr/lib/python3.13/site
 COPY --from=build /usr/share/man/man1/noti-mapper.1 /usr/share/man/man1/
 COPY --from=build /usr/share/man/man5/noti-mapper.d.5 /usr/share/man/man5/
 
-RUN install -dm755 /etc/noti-mapper.d /etc/noti-mapper/plugins \
-    && install -dm750 -o noti-mapper -g noti-mapper /var/lib/noti-mapper
+# The configuration directory is owned by the service user so that a scenario
+# can rewrite it through `exec` without anything being mounted from the host.
+# That is a concession to testing; the real package leaves it root-owned.
+RUN install -dm755 -o noti-mapper -g noti-mapper /etc/noti-mapper.d \
+    && install -dm750 -o noti-mapper -g noti-mapper /etc/noti-mapper \
+    && install -dm755 /etc/noti-mapper/plugins \
+    && install -dm750 -o noti-mapper -g noti-mapper /var/lib/noti-mapper \
+    && install -dm750 -o noti-mapper -g noti-mapper /var/lib/noti-mapper/watched
+
+# A configuration valid enough for the daemon to start. Every scenario
+# overwrites it; it exists so that `compose up` does not fail before a
+# scenario has had a chance to say anything.
+COPY docker/default-config.json /etc/noti-mapper.d/10-default.json
+RUN chown noti-mapper:noti-mapper /etc/noti-mapper.d/10-default.json \
+    && printf '{}' > /etc/noti-mapper/secrets.json \
+    && chown noti-mapper:noti-mapper /etc/noti-mapper/secrets.json \
+    && chmod 0600 /etc/noti-mapper/secrets.json
 
 USER noti-mapper
 

@@ -45,14 +45,10 @@ SETTLE_TIMEOUT_SECONDS = 30.0
 class DaemonUnderTest(abc.ABC):
     """However the daemon happens to be running, this is what a step can ask of it.
 
-    The three paths are attributes rather than methods because both backends
-    hand the test side real host paths: the local one because it is the same
-    filesystem, the container one because the workspace is bind-mounted.
+    Deliberately no host paths. The container mounts nothing from the host, so
+    a step cannot be handed a path and write to it -- everything goes through
+    these methods, and the container backend implements them with `exec`.
     """
-
-    config_directory: Path
-    secrets_path: Path
-    state_directory: Path
 
     @abc.abstractmethod
     def start(self) -> None:
@@ -75,8 +71,24 @@ class DaemonUnderTest(abc.ABC):
         """Where a scenario POSTs to make an input fire."""
 
     @abc.abstractmethod
-    def watched_directory(self) -> Path:
-        """A directory the file input watches, writable from the test side."""
+    def watched_path(self) -> str:
+        """Where the file input watches, as the *daemon* sees it."""
+
+    @abc.abstractmethod
+    def write_config(self, name: str, text: str) -> None:
+        """Put a file into the daemon's configuration directory."""
+
+    @abc.abstractmethod
+    def read_config(self, name: str) -> str:
+        """Read one back, for a step that wants to amend it."""
+
+    @abc.abstractmethod
+    def write_secrets(self, text: str) -> None:
+        """Write the secrets file, mode 0600."""
+
+    @abc.abstractmethod
+    def create_watched_file(self, name: str, *, contents: str, age_hours: float) -> None:
+        """Make a file appear where the file input is watching."""
 
     @abc.abstractmethod
     def pagerduty_base_url(self) -> str:
@@ -119,13 +131,8 @@ class World:
             with error:
                 return int(error.code)
 
-    def drop_file(self, name: str, *, contents: str = "delivered", age_hours: float = 0.0) -> Path:
-        path = self.daemon.watched_directory() / name
-        path.write_text(contents, encoding="utf-8")
-        if age_hours:
-            when = time.time() - age_hours * 3600
-            os.utime(path, (when, when))
-        return path
+    def drop_file(self, name: str, *, contents: str = "delivered", age_hours: float = 0.0) -> None:
+        self.daemon.create_watched_file(name, contents=contents, age_hours=age_hours)
 
     # -- waiting --------------------------------------------------------------
 
@@ -232,8 +239,25 @@ class LocalDaemon(DaemonUnderTest):
     def webhook_url(self) -> str:
         return f"http://127.0.0.1:{WEBHOOK_PORT}/hook"
 
-    def watched_directory(self) -> Path:
-        return self.watched
+    def write_config(self, name: str, text: str) -> None:
+        (self.config_directory / name).write_text(text, encoding="utf-8")
+
+    def read_config(self, name: str) -> str:
+        return (self.config_directory / name).read_text(encoding="utf-8")
+
+    def write_secrets(self, text: str) -> None:
+        self.secrets_path.write_text(text, encoding="utf-8")
+        self.secrets_path.chmod(0o600)
+
+    def create_watched_file(self, name: str, *, contents: str, age_hours: float) -> None:
+        path = self.watched / name
+        path.write_text(contents, encoding="utf-8")
+        if age_hours:
+            when = time.time() - age_hours * 3600
+            os.utime(path, (when, when))
+
+    def watched_path(self) -> str:
+        return str(self.watched)
 
     def pagerduty_base_url(self) -> str:
         return self._pagerduty_url
@@ -264,25 +288,22 @@ class LocalDaemon(DaemonUnderTest):
 
 
 class ContainerDaemon(DaemonUnderTest):
-    """The daemon as the packaged container, driven through docker compose.
+    """The daemon as the packaged container, driven entirely through `exec`.
 
-    The workspace is bind-mounted, so configuration is written and watched
-    files are dropped from the test side exactly as the local backend does.
+    Nothing from the host is mounted. The image carries the code and a default
+    configuration, and a scenario reshapes that configuration by writing into
+    the running container rather than by sharing a directory with it. That is
+    the point: there is no host path for this to write to, so there is nothing
+    it can damage.
     """
+
+    CONFIG = "/etc/noti-mapper.d"
+    SECRETS = "/etc/noti-mapper/secrets.json"
+    WATCHED = "/var/lib/noti-mapper/watched"
 
     def __init__(self, *, workspace: Path, pagerduty_url: str) -> None:
         self._workspace = workspace
         self._pagerduty_url = pagerduty_url
-
-        self.config_directory = workspace / "conf.d"
-        self.state_directory = workspace / "state"
-        self.secrets_path = workspace / "secrets.json"
-        self.watched = workspace / "watched"
-        for directory in (self.config_directory, self.state_directory, self.watched):
-            directory.mkdir(parents=True, exist_ok=True)
-        # The image runs as the noti-mapper user, which will not share this
-        # machine's uid; the bind mount has to be writable by it either way.
-        self.state_directory.chmod(0o777)
 
     def _compose(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -290,8 +311,24 @@ class ContainerDaemon(DaemonUnderTest):
             cwd=REPOSITORY,
             capture_output=True,
             text=True,
-            env={**os.environ, "NOTI_BDD_WORKSPACE": str(self._workspace)},
         )
+
+    def _exec(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return self._compose("exec", "-T", "noti-mapper", *arguments)
+
+    def _write_into(self, path: str, text: str, *, mode: str | None = None) -> None:
+        written = self._compose("exec", "-T", "noti-mapper", "sh", "-c", f"cat > {path}")
+        # compose exec does not take stdin from a string, so the write goes
+        # through a shell heredoc instead.
+        del written
+        quoted = text.replace("'", "'\\''")
+        result = self._exec("sh", "-c", f"printf '%s' '{quoted}' > {path}")
+        if result.returncode != 0:
+            raise AssertionError(f"could not write {path}:\n{result.stdout}{result.stderr}")
+        if mode is not None:
+            self._exec("chmod", mode, path)
+
+    # -- lifecycle ------------------------------------------------------------
 
     def start(self) -> None:
         result = self._compose("up", "-d", "--wait", "noti-mapper")
@@ -308,28 +345,53 @@ class ContainerDaemon(DaemonUnderTest):
 
     @property
     def running(self) -> bool:
-        result = self._compose("ps", "--status", "running", "--quiet", "noti-mapper")
-        return bool(result.stdout.strip())
+        return bool(
+            self._compose("ps", "--status", "running", "--quiet", "noti-mapper").stdout.strip()
+        )
 
     def cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return self._compose("exec", "-T", "noti-mapper", "noti-mapper", *arguments)
+        return self._exec("noti-mapper", *arguments)
 
     def webhook_url(self) -> str:
         return f"http://127.0.0.1:{WEBHOOK_PORT}/hook"
 
-    def watched_directory(self) -> Path:
-        return self.watched
+    # -- configuration, written into the container ----------------------------
+
+    def write_config(self, name: str, text: str) -> None:
+        self._write_into(f"{self.CONFIG}/{name}", text)
+
+    def read_config(self, name: str) -> str:
+        result = self._exec("cat", f"{self.CONFIG}/{name}")
+        if result.returncode != 0:
+            raise AssertionError(f"could not read {name}:\n{result.stderr}")
+        return result.stdout
+
+    def write_secrets(self, text: str) -> None:
+        self._write_into(self.SECRETS, text, mode="0600")
+
+    def create_watched_file(self, name: str, *, contents: str, age_hours: float) -> None:
+        path = f"{self.WATCHED}/{name}"
+        self._write_into(path, contents)
+        if age_hours:
+            # touch -d wants a date; seconds-since-epoch is unambiguous.
+            when = time.time() - age_hours * 3600
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(when))
+            self._exec("touch", "-d", stamp, path)
+
+    def watched_path(self) -> str:
+        return self.WATCHED
 
     def pagerduty_base_url(self) -> str:
-        # Inside the container the stub is reachable on the host gateway; the
-        # compose file adds the alias.
+        # The stub runs in the behave process on the host; the compose file
+        # adds the gateway alias so the container can reach it. This is the
+        # only thing that crosses the boundary, and it is outbound HTTP.
         return self._pagerduty_url.replace("127.0.0.1", "host.docker.internal")
 
     def logs(self) -> str:
         return self._compose("logs", "--no-color", "--tail", "200", "noti-mapper").stdout
 
     def tear_down(self) -> None:
-        self._compose("down", "-v", "-t", "10")
+        self._compose("down", "-t", "10")
 
 
 # -- assembling the world -----------------------------------------------------
@@ -363,9 +425,6 @@ def write_configuration(daemon: DaemonUnderTest, *, rules: dict[str, dict[str, l
     stub. That is enough surface for latching, coupling, retries, and
     reconciliation, and every part of it is observable from outside the daemon.
     """
-    config_directory = daemon.config_directory
-    secrets_path = daemon.secrets_path
-    watched = daemon.watched_directory()
     base = daemon.pagerduty_base_url()
 
     instances: dict[str, object] = {
@@ -381,7 +440,7 @@ def write_configuration(daemon: DaemonUnderTest, *, rules: dict[str, dict[str, l
         "Porch Files": {
             "plugin": "file-input",
             "config": {
-                "path": str(_container_path(daemon, watched)),
+                "path": daemon.watched_path(),
                 "glob": "*.txt",
                 "poll_seconds": 0.2,
                 "debounce_seconds": 0.4,
@@ -391,18 +450,13 @@ def write_configuration(daemon: DaemonUnderTest, *, rules: dict[str, dict[str, l
         "Hall Pager": _pager("Hall Pager", base),
     }
 
-    (config_directory / "10-instances.json").write_text(
-        json.dumps({"instances": instances}, indent=2), encoding="utf-8"
-    )
-    (config_directory / "20-rules.json").write_text(
-        json.dumps({"rules": rules}, indent=2), encoding="utf-8"
-    )
-    (config_directory / "30-daemon.json").write_text(
+    daemon.write_config("10-instances.json", json.dumps({"instances": instances}, indent=2))
+    daemon.write_config("20-rules.json", json.dumps({"rules": rules}, indent=2))
+    daemon.write_config(
+        "30-daemon.json",
         json.dumps({"daemon": {"retry_initial_seconds": 1, "retry_max_seconds": 4}}, indent=2),
-        encoding="utf-8",
     )
-    secrets_path.write_text(json.dumps({"webhook_secret": WEBHOOK_SECRET}), encoding="utf-8")
-    secrets_path.chmod(0o600)
+    daemon.write_secrets(json.dumps({"webhook_secret": WEBHOOK_SECRET}))
 
 
 def _pager(name: str, base: str) -> dict[str, object]:
@@ -422,17 +476,6 @@ def _pager(name: str, base: str) -> dict[str, object]:
 def dedup_key_for(instance: str) -> str:
     """The key the PagerDuty output uses, so a scenario can look the incident up."""
     return f"noti-mapper/{instance}"
-
-
-def _container_path(daemon: DaemonUnderTest, host_path: Path) -> Path:
-    """Translate a host path into what the daemon will see.
-
-    The local backend sees the same filesystem. The container sees the bind
-    mount, which compose puts at a fixed place.
-    """
-    if isinstance(daemon, ContainerDaemon):
-        return Path("/workspace") / host_path.name
-    return host_path
 
 
 def start_stub() -> PagerDutyStub:
