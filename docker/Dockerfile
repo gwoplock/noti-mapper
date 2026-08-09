@@ -61,7 +61,7 @@ RUN python -m build --wheel --no-isolation --outdir=/tmp/wheel \
 
 FROM archlinux:base AS runtime
 
-RUN pacman -Syu --noconfirm --needed python avahi && pacman -Scc --noconfirm
+RUN pacman -Syu --noconfirm --needed python avahi python-orjson python-chacha20poly1305-reuseable python-h11 python-zeroconf python-cryptography python-ifaddr && pacman -Scc --noconfirm
 
 # The same sysusers fragment the package ships, so the uid and the home
 # directory are the ones a real install gets.
@@ -69,10 +69,21 @@ COPY --from=build /usr/lib/sysusers.d/noti-mapper.conf /usr/lib/sysusers.d/
 RUN systemd-sysusers
 
 COPY --from=build /usr/bin/noti-mapper /usr/bin/noti-mapper
-COPY --from=build /usr/lib/python3*/site-packages/noti_mapper /usr/lib/python3.13/site-packages/noti_mapper
 COPY --from=build /usr/lib/noti-mapper /usr/lib/noti-mapper
-COPY --from=build /usr/lib/python3*/site-packages/imapclient /usr/lib/python3.13/site-packages/imapclient
-COPY --from=build /usr/lib/python3*/site-packages/pyhap /usr/lib/python3.13/site-packages/pyhap
+
+# Staged, then moved to wherever this image's interpreter actually looks.
+# COPY cannot expand a shell variable in its destination, so naming a version
+# here would hard-code one: the build that found this had 3.14 as the
+# interpreter and the packages landing in a 3.13 directory, which imports
+# exactly nowhere.
+COPY --from=build /usr/lib/python3*/site-packages/noti_mapper /stage/noti_mapper
+COPY --from=build /usr/lib/python3*/site-packages/imapclient /stage/imapclient
+COPY --from=build /usr/lib/python3*/site-packages/pyhap /stage/pyhap
+RUN target="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
+    && install -dm755 "$target" \
+    && mv /stage/noti_mapper /stage/imapclient /stage/pyhap "$target"/ \
+    && rmdir /stage \
+    && python -c 'import noti_mapper, imapclient, pyhap' 
 COPY --from=build /usr/share/man/man1/noti-mapper.1 /usr/share/man/man1/
 COPY --from=build /usr/share/man/man5/noti-mapper.d.5 /usr/share/man/man5/
 

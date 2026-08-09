@@ -5,6 +5,9 @@
 # system dependencies properly rather than vendoring a venv inside noti-mapper.
 
 _name=HAP-python
+# PyPI normalizes sdist filenames per PEP 625, so the tarball is hap_python-
+# and not HAP-python-. The legacy /packages/source/H/HAP-python/ path 404s.
+_dist=hap_python
 pkgname=python-hap-python
 pkgver=5.0.0
 pkgrel=1
@@ -25,16 +28,16 @@ optdepends=(
   'python-pyqrcode: QR code display for pairing'
 )
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
-source=("https://files.pythonhosted.org/packages/source/${_name:0:1}/${_name}/${_name}-${pkgver}.tar.gz")
-sha256sums=('SKIP')
+source=("https://files.pythonhosted.org/packages/source/${_dist:0:1}/${_dist}/${_dist}-${pkgver}.tar.gz")
+sha256sums=('455d3ac0721cc9cbb6373cf8c9422c3182db2d95c472f94d3a65cc94dda7434d')
 
 build() {
-  cd "${_name}-${pkgver}"
+  cd "${_dist}-${pkgver}"
   python -m build --wheel --no-isolation
 }
 
 package() {
-  cd "${_name}-${pkgver}"
+  cd "${_dist}-${pkgver}"
   python -m installer --destdir="${pkgdir}" dist/*.whl
   install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }
