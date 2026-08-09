@@ -20,7 +20,7 @@ services:
       # Loopback only. The webhook input is a test fixture, not something to
       # put on the network.
       - "127.0.0.1:9736:9736"
-    command: ["run", "--log-level", "info"]
+    command: ["--log-level", "info", "run"]   # global options precede the subcommand
     healthcheck:
       # Readiness is the webhook socket accepting, which the daemon only opens
       # after configuration has validated and reconciliation has finished.
