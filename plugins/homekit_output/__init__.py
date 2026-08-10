@@ -313,8 +313,31 @@ class HomeKitOutput(OutputPlugin):
         self._set_health(HealthStatus.STOPPED, "not running")
 
     def health(self) -> PluginHealth:
+        """How the accessory is doing, including whether anyone has paired.
+
+        The pairing state is worked out on each call rather than recorded at
+        start, because pairing happens minutes or days later and a value
+        captured at start would be wrong for exactly as long as it mattered.
+        The core polls this on a timer, so ``noti-mapper status`` catches up on
+        its own.
+        """
         with self._state_lock:
-            return PluginHealth(status=self._status, detail=self._detail)
+            status = self._status
+            detail = self._detail
+
+        if status is not HealthStatus.OK:
+            return PluginHealth(status=status, detail=detail)
+
+        if self.paired():
+            return PluginHealth(status=status, detail=f"{detail}; paired")
+
+        # An accessory nobody has paired with cannot deliver a notification, so
+        # it is not OK -- and this is the line the user will be looking at when
+        # they wonder why nothing is happening. It carries the code.
+        return PluginHealth(
+            status=HealthStatus.DEGRADED,
+            detail=f"{detail}; not paired -- setup code {self.setup_code()}",
+        )
 
     # -- the write direction --------------------------------------------------
 
