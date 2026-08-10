@@ -17,8 +17,10 @@ DEFAULT_POLL_SECONDS = 60
 DEFAULT_PORT_TLS = 993
 DEFAULT_PORT_PLAIN = 143
 
-REQUIRED_KEYS = ("host", "username", "password", "senders", "subject_patterns")
+REQUIRED_KEYS = ("host", "username", "password")
 OPTIONAL_KEYS = (
+    "senders",
+    "subject_patterns",
     "port",
     "ssl",
     "folder",
@@ -126,11 +128,22 @@ def _string_problems(settings: Mapping[str, object], key: str) -> list[str]:
 
 
 def _string_list_problems(settings: Mapping[str, object], key: str) -> list[str]:
+    """Absent is allowed and means "any". Present-but-empty is a mistake.
+
+    Omitting the key and writing ``[]`` read as the same intent to a person and
+    would have to mean the same thing, but ``[]`` also arrives by accident --
+    an edit that removed the last entry, a template rendered with nothing to
+    put in it. Since the effect of getting this wrong is a mailbox that latches
+    on every message, the ambiguous spelling is refused and the unambiguous one
+    is required.
+    """
     value = settings.get(key)
     if value is None:
         return []
-    if not isinstance(value, list) or not value:
-        return [f'"{key}" must be a non-empty array of strings']
+    if not isinstance(value, list):
+        return [f'"{key}" must be an array of strings']
+    if not value:
+        return [f'"{key}" is empty; omit it entirely to match any value']
     for item in value:
         if not isinstance(item, str) or not item.strip():
             return [f'"{key}" entries must be non-empty strings']

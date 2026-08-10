@@ -226,9 +226,25 @@ def test_a_complete_configuration_validates() -> None:
 
 def test_every_required_key_is_reported() -> None:
     problems = validate({})
-    assert len(problems) == 5
-    for key in ("host", "username", "password", "senders", "subject_patterns"):
+    assert len(problems) == 3
+    for key in ("host", "username", "password"):
         assert any(f'"{key}" is required' in problem for problem in problems)
+
+
+def test_the_matching_criteria_are_not_required() -> None:
+    bare = {"host": "mail.example.net", "username": "user@example.net", "password": "hunter2"}
+    assert validate(bare) == []
+
+    criteria = build(bare).criteria
+    assert criteria.constrains_sender is False
+    assert criteria.constrains_subject is False
+
+
+@pytest.mark.parametrize("key", ["senders", "subject_patterns"])
+def test_either_criterion_may_be_left_out_on_its_own(key: str) -> None:
+    settings = _settings()
+    del settings[key]
+    assert validate(settings) == []
 
 
 def test_an_unknown_setting_is_reported() -> None:
@@ -241,9 +257,18 @@ def test_an_invalid_subject_pattern_is_reported() -> None:
     assert any("is not a valid regex" in problem for problem in problems)
 
 
-def test_empty_lists_are_rejected() -> None:
-    assert any("non-empty array" in problem for problem in validate(_settings(senders=[])))
-    assert any("non-empty array" in problem for problem in validate(_settings(subject_patterns=[])))
+@pytest.mark.parametrize("key", ["senders", "subject_patterns"])
+def test_an_explicitly_empty_list_is_rejected_in_favour_of_omitting_the_key(key: str) -> None:
+    # Omitting means "any"; [] is the spelling that arrives by accident, so it
+    # is refused rather than quietly matching everything.
+    problems = validate(_settings(**{key: []}))
+    assert problems == [f'"{key}" is empty; omit it entirely to match any value']
+
+
+@pytest.mark.parametrize("key", ["senders", "subject_patterns"])
+def test_a_non_list_is_still_rejected(key: str) -> None:
+    problems = validate(_settings(**{key: "ups.com"}))
+    assert problems == [f'"{key}" must be an array of strings']
 
 
 def test_type_errors_are_reported() -> None:
