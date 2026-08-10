@@ -9,6 +9,14 @@ one of the patterns. Both, not either. A carrier sends far more mail than
 delivery notifications, and a subject pattern alone matches marketing mail from
 anyone.
 
+Either constraint may be left out, and leaving one out means "any". A mailbox
+that a filter already feeds only delivery mail needs no allowlist, and an
+address used for nothing else needs no subject patterns. This is an *and* over
+the constraints that exist, so dropping one widens what matches -- and dropping
+both matches every message in the folder. That last case is legal and
+occasionally what someone wants; the plugin says so out loud at startup rather
+than leaving it to be discovered.
+
 Message bodies are never parsed. Carrier and notification HTML changes
 constantly and it is not worth the fragility.
 """
@@ -59,7 +67,11 @@ class MatchResult:
 
 
 class Criteria:
-    """A sender allowlist and a set of subject patterns."""
+    """A sender allowlist and a set of subject patterns, either of which may be empty.
+
+    An empty list is not "matches nothing", it is "does not constrain". See the
+    module docstring for why.
+    """
 
     def __init__(self, *, senders: list[str], subject_patterns: list[str]) -> None:
         self._senders = [sender.strip().lower() for sender in senders]
@@ -74,13 +86,29 @@ class Criteria:
     def subject_patterns(self) -> list[str]:
         return list(self._pattern_sources)
 
+    @property
+    def constrains_sender(self) -> bool:
+        return bool(self._senders)
+
+    @property
+    def constrains_subject(self) -> bool:
+        return bool(self._patterns)
+
     def sender_allowed(self, address: str) -> bool:
         """True when the address is, or is at, an allowlisted sender.
 
         An entry with an ``@`` is matched as a whole address. An entry without
         one is matched as a domain, including subdomains, so ``ups.com`` covers
         ``noreply@mail.ups.com`` but not ``ups.com.example.net``.
+
+        With no allowlist every sender is allowed, including one that could not
+        be parsed into an address at all. "No allowlist" has to mean no
+        allowlist; a message is not worth dropping over a malformed From header
+        when the user has asked for all of them.
         """
+        if not self._senders:
+            return True
+
         candidate = address.strip().lower()
         if not candidate:
             return False
@@ -96,6 +124,8 @@ class Criteria:
         return False
 
     def subject_matches(self, subject: str) -> bool:
+        if not self._patterns:
+            return True
         return any(pattern.search(subject) is not None for pattern in self._patterns)
 
     def evaluate(self, *, sender: str, subject: str) -> MatchResult:
@@ -103,7 +133,21 @@ class Criteria:
             return MatchResult(matched=False, reason=f"sender {sender!r} is not on the allowlist")
         if not self.subject_matches(subject):
             return MatchResult(matched=False, reason=f"subject {subject!r} matches no pattern")
-        return MatchResult(matched=True, reason=f"subject {subject!r} matched")
+        return MatchResult(matched=True, reason=self._match_reason(subject))
+
+    def _match_reason(self, subject: str) -> str:
+        """Why a message matched, phrased so the dry-run log is worth reading.
+
+        Naming the unconstrained side is the point. "matched" against a
+        configuration that constrains nothing tells the user only that mail
+        arrived, and they have to go back to the config to learn why every
+        message is matching.
+        """
+        if self.constrains_subject:
+            return f"subject {subject!r} matched"
+        if self.constrains_sender:
+            return "sender is allowed and no subject pattern is configured"
+        return "nothing is configured to match on, so every message matches"
 
 
 def compile_problems(patterns: list[str]) -> list[str]:
