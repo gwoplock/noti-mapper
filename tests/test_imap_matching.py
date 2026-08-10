@@ -126,6 +126,56 @@ def test_both_the_sender_and_the_subject_must_match() -> None:
     assert "matches no pattern" in wrong_subject.reason
 
 
+# -- a constraint that was left out -------------------------------------------
+
+
+def test_no_allowlist_allows_every_sender() -> None:
+    criteria = Criteria(senders=[], subject_patterns=DELIVERED_PATTERNS)
+
+    assert criteria.constrains_sender is False
+    assert criteria.sender_allowed("someone@example.net") is True
+    assert criteria.sender_allowed("mcinfo@ups.com") is True
+    # No allowlist has to mean no allowlist, even for a From we could not parse.
+    assert criteria.sender_allowed("") is True
+    assert criteria.sender_allowed("not-an-address") is True
+
+
+def test_no_subject_patterns_match_every_subject() -> None:
+    criteria = Criteria(senders=CARRIER_SENDERS, subject_patterns=[])
+
+    assert criteria.constrains_subject is False
+    assert criteria.subject_matches("Out for delivery") is True
+    assert criteria.subject_matches("") is True
+
+
+def test_the_other_constraint_still_applies_when_one_is_left_out() -> None:
+    senders_only = Criteria(senders=CARRIER_SENDERS, subject_patterns=[])
+    assert senders_only.evaluate(sender="mcinfo@ups.com", subject="anything").matched is True
+    rejected = senders_only.evaluate(sender="marketing@example.net", subject="anything")
+    assert rejected.matched is False
+    assert "not on the allowlist" in rejected.reason
+
+    subjects_only = Criteria(senders=[], subject_patterns=DELIVERED_PATTERNS)
+    good = subjects_only.evaluate(sender="anyone@example.net", subject="Delivered: a box")
+    assert good.matched is True
+    assert subjects_only.evaluate(sender="anyone@example.net", subject="Shipped").matched is False
+
+
+def test_with_neither_constraint_everything_matches() -> None:
+    criteria = Criteria(senders=[], subject_patterns=[])
+
+    result = criteria.evaluate(sender="anyone@example.net", subject="Save 20% today")
+    assert result.matched is True
+    # The dry-run log has to say why, or "matched" is unreadable here.
+    assert "every message matches" in result.reason
+
+
+def test_the_match_reason_names_the_side_that_is_unconstrained() -> None:
+    senders_only = Criteria(senders=CARRIER_SENDERS, subject_patterns=[])
+    result = senders_only.evaluate(sender="mcinfo@ups.com", subject="Out for delivery")
+    assert "no subject pattern is configured" in result.reason
+
+
 # -- RFC 2047 -----------------------------------------------------------------
 
 
