@@ -7,6 +7,7 @@ test suite that pays that per test stops being run. Starting the network side
 is covered end-to-end by the runtime tests with the probe plugins.
 """
 
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -103,6 +104,51 @@ def test_applying_before_start_raises_so_the_push_retries(
     plugin = _plugin(tmp_path, database, [])
     with pytest.raises(PluginError, match="not running"):
         plugin.apply(OutputUpdate(state=True))
+
+
+# -- pairing ------------------------------------------------------------------
+
+
+def test_an_unpaired_accessory_says_so_after_the_persist_file_exists(
+    tmp_path: Path, database: Database
+) -> None:
+    # The persist file is written when the driver starts, not when a controller
+    # pairs, so its existence says nothing about pairing. Inferring one from
+    # the other loses the setup code after the very first start.
+    first = _plugin(tmp_path, database, [])
+    first.build_accessory()
+    driver = first._driver  # noqa: SLF001
+    assert driver is not None
+    driver.persist()
+    first.stop()
+
+    persist_file = tmp_path / "state" / "plugins" / "Porch Lamp" / PERSIST_FILENAME
+    assert persist_file.exists()
+
+    second = _plugin(tmp_path, database, [])
+    second.build_accessory()
+    try:
+        assert second.paired() is False
+    finally:
+        second.stop()
+
+
+def test_a_paired_accessory_says_so(started: tuple[HomeKitOutput, list[str]]) -> None:
+    plugin, _ = started
+    driver = plugin._driver  # noqa: SLF001
+    assert driver is not None
+    assert plugin.paired() is False
+
+    # What HAP-python records once a controller finishes pairing: a client id,
+    # its public key, and the admin permission byte.
+    driver.state.add_paired_client(str(uuid.uuid4()).encode("utf-8"), b"public-key", b"\x01")
+    assert plugin.paired() is True
+
+
+def test_pairing_is_unknown_before_the_accessory_is_built(
+    tmp_path: Path, database: Database
+) -> None:
+    assert _plugin(tmp_path, database, []).paired() is False
 
 
 # -- the write direction ------------------------------------------------------

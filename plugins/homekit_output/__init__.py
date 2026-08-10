@@ -131,7 +131,6 @@ class HomeKitOutput(OutputPlugin):
         self._accessory: LatchSwitch | None = None
         self._thread: threading.Thread | None = None
         self._persist_file = context.state_directory / PERSIST_FILENAME
-        self._first_run = True
         self._state_lock = threading.Lock()
         self._status = HealthStatus.STARTING
         self._detail = "not yet started"
@@ -149,7 +148,6 @@ class HomeKitOutput(OutputPlugin):
         without the second.
         """
         persist_file = self.context.state_path(PERSIST_FILENAME)
-        first_run = not persist_file.exists()
 
         driver = AccessoryDriver(
             port=self._port,
@@ -163,7 +161,20 @@ class HomeKitOutput(OutputPlugin):
         self._driver = driver
         self._accessory = accessory
         self._persist_file = persist_file
-        self._first_run = first_run
+
+    def paired(self) -> bool:
+        """Whether a controller has completed pairing.
+
+        Asked of the driver rather than inferred from the persist file. The
+        file is written when the driver starts, pairing or no pairing, so its
+        existence answers "has this ever run?" and not "is it paired?" -- and
+        the two differ during exactly the window where the setup code still
+        matters.
+        """
+        driver = self._driver
+        if driver is None:
+            return False
+        return bool(driver.state.paired)
 
     def _pincode(self) -> bytes:
         """The setup code, generated once and kept.
@@ -208,7 +219,7 @@ class HomeKitOutput(OutputPlugin):
             self._persist_file,
             extra={"instance": self.context.instance_name},
         )
-        if self._first_run:
+        if not self.paired():
             self._log.info(
                 "not yet paired. Add the accessory in the Home app with setup code %s. "
                 "This adds one accessory to your existing home; nothing you already "
