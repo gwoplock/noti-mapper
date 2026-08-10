@@ -332,8 +332,8 @@ deliberate acts; nothing is deleted behind your back.
 | `host`                      | yes      |         |                                                      |
 | `username`                  | yes      |         |                                                      |
 | `password`                  | yes      |         | Use `${secret:...}`.                                 |
-| `senders`                   | yes      |         | Allowlist. Bare domains match subdomains.            |
-| `subject_patterns`          | yes      |         | Regular expressions, matched against decoded subject.|
+| `senders`                   | no       | any     | Allowlist. Bare domains match subdomains.            |
+| `subject_patterns`          | no       | any     | Regular expressions, matched against decoded subject.|
 | `port`                      | no       | 993/143 | Follows `ssl`.                                       |
 | `ssl`                       | no       | `true`  |                                                      |
 | `folder`                    | no       | `INBOX` |                                                      |
@@ -346,6 +346,38 @@ deliberate acts; nothing is deleted behind your back.
 
 The sender allowlist **and** a subject pattern must both match. A carrier sends
 far more mail than delivery notifications.
+
+Both are optional, and leaving one out means "any". A mailbox that a
+server-side filter already feeds only delivery mail needs no allowlist; an
+address used for nothing else needs no subject patterns:
+
+```json
+{
+  "host": "mail.example.net",
+  "username": "packages@example.net",
+  "password": "${secret:packages_password}",
+  "folder": "Deliveries"
+}
+```
+
+That config matches **every message** in `Deliveries`, which is the point when
+a filter is doing the work upstream. The reader warns about it at startup
+anyway, because a config file that has lost its `subject_patterns` line looks
+exactly the same from in here — the warning reads *"Porch Mail has neither a
+sender allowlist nor subject patterns, so every message in Deliveries will be
+treated as an event."* Leaving out only one of the two is an `INFO` line
+saying which.
+
+Writing `"senders": []` is an error rather than a synonym for omitting it. An
+empty array is what an edit that removed the last entry leaves behind, and the
+cost of reading that as "match everything" is a mailbox that latches on all
+mail:
+
+```
+noti-mapper: 1 configuration error:
+  /etc/noti-mapper.d/10-instances.json: instances → 'Porch Mail' → config:
+      instance 'Porch Mail': "senders" is empty; omit it entirely to match any value
+```
 
 **Use `dry_run` first.** Set it to `true`, leave it a week, and read the
 journal. It will tell you what it would have fired on, which is how you find
