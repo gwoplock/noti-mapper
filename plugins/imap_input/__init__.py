@@ -10,6 +10,10 @@ oversights:
   nothing is deleted. The user's mail client behaviour is completely
   unaffected.
 * Message bodies are never parsed. Only the sender and the decoded subject.
+* Neither the sender allowlist nor the subject patterns are required, and
+  leaving one out means "any". Leaving out both makes every message in the
+  folder an event, which is occasionally the point and is announced at startup
+  either way.
 * In dry-run mode nothing is emitted at all. Every message is evaluated and
   logged with what would have happened, so a user can tune patterns against
   live mail for a week before arming it. That is the difference between a
@@ -70,6 +74,44 @@ class ImapInput(InputPlugin):
         self._state_lock = threading.Lock()
         self._status = HealthStatus.STARTING
         self._detail = "not yet connected"
+        self._announce_criteria()
+
+    def _announce_criteria(self) -> None:
+        """Say what this reader will match on, loudly when that is everything.
+
+        Both criteria are optional and leaving one out widens what matches, so
+        the config file no longer shows the whole story -- a reader with no
+        subject patterns looks, on the page, much like one whose patterns are
+        elsewhere. Saying it at startup means the journal answers "why did this
+        fire?" without the config file in the other hand.
+
+        Matching every message is a legitimate configuration for a mailbox that
+        exists for one purpose. It is also what a truncated config file
+        produces, and the two are indistinguishable from here, so it gets a
+        warning rather than an info line.
+        """
+        criteria = self._settings.criteria
+        if not criteria.constrains_sender and not criteria.constrains_subject:
+            self._log.warning(
+                "%s has neither a sender allowlist nor subject patterns, so every "
+                'message in %s will be treated as an event. Set "senders" or '
+                '"subject_patterns" if that is not what you meant.',
+                self.context.instance_name,
+                self._settings.folder,
+                extra={"instance": self.context.instance_name, "folder": self._settings.folder},
+            )
+            return
+
+        if not criteria.constrains_sender:
+            self._log.info(
+                "no sender allowlist; any sender matching a subject pattern is an event",
+                extra={"instance": self.context.instance_name},
+            )
+        if not criteria.constrains_subject:
+            self._log.info(
+                "no subject patterns; any message from an allowlisted sender is an event",
+                extra={"instance": self.context.instance_name},
+            )
 
     # -- lifecycle ------------------------------------------------------------
 
