@@ -7,13 +7,14 @@ test suite that pays that per test stops being run. Starting the network side
 is covered end-to-end by the runtime tests with the probe plugins.
 """
 
+import stat
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from homekit_output import PERSIST_FILENAME, HomeKitOutput
+from homekit_output import PERSIST_FILENAME, SETUP_CODE_FILENAME, HomeKitOutput
 from noti_mapper.plugin import OutputUpdate, PluginError, RemoteBelief
 from noti_mapper.storage import Database, HealthStatus, database_path, initialize
 from tests.support import make_context
@@ -149,6 +150,96 @@ def test_pairing_is_unknown_before_the_accessory_is_built(
     tmp_path: Path, database: Database
 ) -> None:
     assert _plugin(tmp_path, database, []).paired() is False
+
+
+# -- keeping the setup code ---------------------------------------------------
+
+
+def test_the_setup_code_is_written_beside_the_pairing_state(
+    started: tuple[HomeKitOutput, list[str]], tmp_path: Path
+) -> None:
+    plugin, _ = started
+
+    path = plugin.record_setup_code()
+
+    assert path == tmp_path / "state" / "plugins" / "Porch Lamp" / SETUP_CODE_FILENAME
+    written = path.read_text(encoding="utf-8")
+    assert plugin.setup_code() in written
+    assert "X-HM://" in written
+    # Enough context to be worth finding months later.
+    assert "Porch Lamp" in written
+    assert "Not paired" in written
+
+
+def test_the_setup_code_file_is_readable_only_by_its_owner(
+    started: tuple[HomeKitOutput, list[str]],
+) -> None:
+    plugin, _ = started
+
+    path = plugin.record_setup_code()
+
+    assert path is not None
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_an_existing_file_with_a_wide_mode_is_narrowed(
+    started: tuple[HomeKitOutput, list[str]], tmp_path: Path
+) -> None:
+    plugin, _ = started
+    path = tmp_path / "state" / "plugins" / "Porch Lamp" / SETUP_CODE_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("left over from an older version\n", encoding="utf-8")
+    path.chmod(0o644)
+
+    # O_CREAT's mode applies only when creating, and this file usually exists.
+    plugin.record_setup_code()
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert "left over" not in path.read_text(encoding="utf-8")
+
+
+def test_the_file_says_when_the_accessory_is_already_paired(
+    started: tuple[HomeKitOutput, list[str]],
+) -> None:
+    plugin, _ = started
+    driver = plugin._driver  # noqa: SLF001
+    assert driver is not None
+    driver.state.add_paired_client(str(uuid.uuid4()).encode("utf-8"), b"public-key", b"\x01")
+
+    path = plugin.record_setup_code()
+
+    assert path is not None
+    written = path.read_text(encoding="utf-8")
+    assert "Paired as of" in written
+    # Still the code, because unpairing and adding it again needs it.
+    assert plugin.setup_code() in written
+
+
+def test_a_failure_to_write_is_logged_and_does_not_stop_the_accessory(
+    started: tuple[HomeKitOutput, list[str]],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin, _ = started
+
+    def refuse(path: Path, text: str) -> None:
+        del path, text
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr("homekit_output.write_setup_code_file", refuse)
+
+    with caplog.at_level("WARNING"):
+        assert plugin.record_setup_code() is None
+
+    assert "could not write the HomeKit setup code" in caplog.text
+    # The accessory is untouched and still usable.
+    plugin.apply(OutputUpdate(state=True))
+
+
+def test_recording_before_the_accessory_is_built_is_a_no_op(
+    tmp_path: Path, database: Database
+) -> None:
+    assert _plugin(tmp_path, database, []).record_setup_code() is None
 
 
 # -- the write direction ------------------------------------------------------
