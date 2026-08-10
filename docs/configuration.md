@@ -421,8 +421,34 @@ HAP needs mDNS/Bonjour reachability between the daemon and your Apple Home hub:
 the same L2 segment, or an mDNS reflector if your IoT devices live on their own
 VLAN.
 
-The setup code is printed to the journal on first start and persists, so a
-restart before you have finished pairing does not change it.
+#### Finding the setup code
+
+The code persists, so a restart before you have finished pairing does not
+change it. It is kept in three places, because the journal alone rotates and
+is easy to lose:
+
+1. **`noti-mapper status`**, any time, until you pair:
+
+   ```
+   Plugin health
+     'Desk Lamp'  degraded  (12s ago)  accessory 'Package Waiting' on port 51826; not paired -- setup code 518-08-582
+   ```
+
+   An unpaired accessory reports `degraded` rather than `ok` on purpose. It is
+   running, but it cannot deliver anything, and this is the line you will be
+   reading when you wonder why nothing happens.
+
+2. **`/var/lib/noti-mapper/plugins/<instance>/setup-code.txt`**, mode `0600`,
+   rewritten on every start. It holds the code and an `X-HM://` setup URI you
+   can render as a QR code and scan with the Home app. It stays after pairing,
+   saying so, because removing the accessory and adding it back needs the same
+   code.
+
+3. **The journal**, logged on every start until something pairs — not only the
+   first start.
+
+Treat the code like a password. Anyone who can reach the accessory on your
+network and knows it can pair with it.
 
 ### `pagerduty-output`
 
