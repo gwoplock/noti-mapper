@@ -36,6 +36,7 @@ VLAN'd IoT networks need an mDNS reflector.
 import logging
 import threading
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from pyhap import util as pyhap_util
@@ -55,10 +56,13 @@ from noti_mapper.plugin import (
 )
 from noti_mapper.storage import HealthStatus
 
+from .pairing import setup_code_text, setup_uri, write_setup_code_file
+
 PLUGIN_NAME = "homekit-output"
 
 DEFAULT_PORT = 51826
 PERSIST_FILENAME = "homekit.state"
+SETUP_CODE_FILENAME = "setup-code.txt"
 PINCODE_KEY = "pincode"
 STOP_TIMEOUT_SECONDS = 15.0
 
@@ -176,6 +180,58 @@ class HomeKitOutput(OutputPlugin):
             return False
         return bool(driver.state.paired)
 
+    def setup_code(self) -> str:
+        """The setup code as a person would type it, or "" before it is known."""
+        driver = self._driver
+        if driver is None:
+            return ""
+        return str(driver.state.pincode.decode("utf-8"))
+
+    def setup_uri(self) -> str:
+        """The setup code as a scannable ``X-HM://`` URI, or "" before it is known."""
+        driver = self._driver
+        if driver is None:
+            return ""
+        return setup_uri(setup_code=self.setup_code(), setup_id=str(driver.state.setup_id))
+
+    def record_setup_code(self) -> Path | None:
+        """Write the setup code beside the pairing state, and return where.
+
+        The journal is a bad place to keep something you need to read once,
+        weeks after it was written: it rotates, and finding it means knowing to
+        look for it. This file does not rotate.
+
+        A failure to write is logged and swallowed. The accessory works
+        perfectly well without this file, and refusing to serve because a
+        convenience file could not be written would be the wrong trade.
+        """
+        if self._driver is None:
+            return None
+
+        path = self.context.state_path(SETUP_CODE_FILENAME)
+        try:
+            write_setup_code_file(
+                path,
+                setup_code_text(
+                    instance_name=self.context.instance_name,
+                    display_name=self._display_name,
+                    setup_code=self.setup_code(),
+                    uri=self.setup_uri(),
+                    paired=self.paired(),
+                    written_at=self.context.clock.now(),
+                ),
+            )
+        except OSError as error:
+            self._log.warning(
+                "could not write the HomeKit setup code to %s: %s. The code is in "
+                "this log and in `noti-mapper status`.",
+                path,
+                error,
+                extra={"instance": self.context.instance_name},
+            )
+            return None
+        return path
+
     def _pincode(self) -> bytes:
         """The setup code, generated once and kept.
 
@@ -219,13 +275,15 @@ class HomeKitOutput(OutputPlugin):
             self._persist_file,
             extra={"instance": self.context.instance_name},
         )
+        recorded = self.record_setup_code()
         if not self.paired():
             self._log.info(
                 "not yet paired. Add the accessory in the Home app with setup code %s. "
                 "This adds one accessory to your existing home; nothing you already "
-                "own is affected.",
-                driver.state.pincode.decode("utf-8"),
-                extra={"instance": self.context.instance_name},
+                "own is affected. The code is also in %s.",
+                self.setup_code(),
+                recorded if recorded is not None else "`noti-mapper status`",
+                extra={"instance": self.context.instance_name, "setup_code_file": str(recorded)},
             )
 
     def stop(self) -> None:
