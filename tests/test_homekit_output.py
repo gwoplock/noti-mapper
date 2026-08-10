@@ -242,6 +242,54 @@ def test_recording_before_the_accessory_is_built_is_a_no_op(
     assert _plugin(tmp_path, database, []).record_setup_code() is None
 
 
+# -- pairing state in status output -------------------------------------------
+
+
+def test_an_unpaired_accessory_reports_degraded_with_the_code(
+    started: tuple[HomeKitOutput, list[str]],
+) -> None:
+    plugin, _ = started
+    plugin._set_health(HealthStatus.OK, "accessory 'Porch Lamp' on port 0")  # noqa: SLF001
+
+    report = plugin.health()
+
+    # Nobody paired means nothing can be delivered, and this is the line the
+    # user reads when they wonder why.
+    assert report.status is HealthStatus.DEGRADED
+    assert "not paired" in report.detail
+    assert plugin.setup_code() in report.detail
+
+
+def test_pairing_afterwards_is_picked_up_without_a_restart(
+    started: tuple[HomeKitOutput, list[str]],
+) -> None:
+    plugin, _ = started
+    plugin._set_health(HealthStatus.OK, "accessory 'Porch Lamp' on port 0")  # noqa: SLF001
+    driver = plugin._driver  # noqa: SLF001
+    assert driver is not None
+
+    assert plugin.health().status is HealthStatus.DEGRADED
+    driver.state.add_paired_client(str(uuid.uuid4()).encode("utf-8"), b"public-key", b"\x01")
+
+    # Recomputed per call, because pairing happens long after start.
+    report = plugin.health()
+    assert report.status is HealthStatus.OK
+    assert report.detail.endswith("; paired")
+    assert plugin.setup_code() not in report.detail
+
+
+def test_a_failed_accessory_reports_the_failure_rather_than_the_pairing_state(
+    started: tuple[HomeKitOutput, list[str]],
+) -> None:
+    plugin, _ = started
+    plugin._set_health(HealthStatus.FAILED, "OSError: address already in use")  # noqa: SLF001
+
+    report = plugin.health()
+
+    assert report.status is HealthStatus.FAILED
+    assert report.detail == "OSError: address already in use"
+
+
 # -- the write direction ------------------------------------------------------
 
 
