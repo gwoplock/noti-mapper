@@ -287,9 +287,21 @@ def test_world_readable_secrets_refuse_to_start(workspace: dict[str, Path]) -> N
     secrets.chmod(0o644)
 
     daemon = Daemon(paths=_paths(workspace), notifier=Notifier(address=""), handle_signals=False)
-    with pytest.raises(StartupError, match="chmod 0600"):
+    with pytest.raises(StartupError, match="chmod 0640"):
         daemon.start()
     daemon.stop()
+
+
+def test_group_readable_secrets_start_normally(workspace: dict[str, Path]) -> None:
+    # root-owned and group-readable is the arrangement the packaging documents,
+    # so the daemon has to actually accept it.
+    _default_config(workspace)
+    secrets = workspace["root"] / "secrets.json"
+    secrets.write_text(json.dumps({"pw": "hunter2"}), encoding="utf-8")
+    secrets.chmod(0o640)
+
+    with _daemon(workspace) as daemon:
+        assert daemon is not None
 
 
 # -- reload -------------------------------------------------------------------

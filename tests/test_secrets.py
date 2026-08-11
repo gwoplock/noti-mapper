@@ -78,19 +78,31 @@ def test_secrets_load_from_a_private_file(tmp_path: Path) -> None:
     assert store.names() == ["porch_mail_password"]
 
 
-@pytest.mark.parametrize("mode", [0o644, 0o640, 0o604, 0o666, 0o660])
-def test_group_or_world_readable_secrets_are_refused(tmp_path: Path, mode: int) -> None:
+@pytest.mark.parametrize("mode", [0o644, 0o604, 0o666, 0o660, 0o620, 0o606, 0o601])
+def test_world_readable_or_group_writable_secrets_are_refused(tmp_path: Path, mode: int) -> None:
     path = _write_secrets(tmp_path, {"a": "b"}, mode=mode)
     with pytest.raises(SecretsError) as caught:
         load_secrets(path)
     message = str(caught.value)
     assert f"{mode:04o}" in message
-    assert "chmod 0600" in message
+    assert "chmod 0640" in message
 
 
-def test_mode_0400_is_accepted(tmp_path: Path) -> None:
-    path = _write_secrets(tmp_path, {"a": "b"}, mode=0o400)
+@pytest.mark.parametrize("mode", [0o600, 0o400, 0o640, 0o440])
+def test_the_arrangements_a_daemon_can_actually_use_are_accepted(tmp_path: Path, mode: int) -> None:
+    # 0600 means the daemon owns the file. 0640 means root owns it and the
+    # daemon's group reads it, which is better: the process on the network
+    # cannot then rewrite its own credentials.
+    path = _write_secrets(tmp_path, {"a": "b"}, mode=mode)
     assert load_secrets(path).get("a") == "b"
+
+
+def test_a_group_readable_file_is_no_longer_refused(tmp_path: Path) -> None:
+    # The regression this guards: requiring 0600 forced the secrets file to be
+    # owned by the daemon user, handing the daemon write access to its own
+    # credentials in the name of tightening permissions.
+    path = _write_secrets(tmp_path, {"webhook_token": "s3cret"}, mode=0o640)
+    assert load_secrets(path).get("webhook_token") == "s3cret"
 
 
 def test_non_object_secrets_file_is_refused(tmp_path: Path) -> None:

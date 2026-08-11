@@ -182,7 +182,7 @@ def test_validate_refuses_readable_secrets(
     secrets.chmod(0o644)
 
     assert main(_argv(workspace, "validate")) == EXIT_CONFIG_ERROR
-    assert "chmod 0600" in capsys.readouterr().err
+    assert "chmod 0640" in capsys.readouterr().err
 
 
 def test_validate_warns_about_broken_plugins_without_failing(
