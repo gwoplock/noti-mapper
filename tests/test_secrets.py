@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,50 @@ def test_a_missing_secrets_file_is_not_an_error(tmp_path: Path) -> None:
     store = load_secrets(tmp_path / "absent.json")
     assert store.values == {}
     assert store.get("anything") is None
+
+
+def test_a_missing_parent_directory_is_also_just_a_missing_file(tmp_path: Path) -> None:
+    store = load_secrets(tmp_path / "no-such-directory" / "secrets.json")
+    assert store.values == {}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_an_unreadable_secrets_file_is_an_error_rather_than_an_empty_one(
+    tmp_path: Path,
+) -> None:
+    # The failure this reproduces: the file is present and full of secrets, but
+    # a directory above it is not searchable by the user we run as. Reporting
+    # that as "no secrets" tells the user every secret is undefined while they
+    # are looking straight at the file that defines them.
+    directory = tmp_path / "etc"
+    directory.mkdir()
+    path = _write_secrets(directory, {"webhook_token": "s3cret"})
+    directory.chmod(0o000)
+    try:
+        with pytest.raises(SecretsError) as caught:
+            load_secrets(path)
+    finally:
+        directory.chmod(0o755)
+
+    message = str(caught.value)
+    assert "cannot be read" in message
+    assert str(path) in message
+    assert "Permission denied" in message
+    # The distinction the old code lost, stated outright.
+    assert "rather than a missing file" in message
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_an_unreadable_file_in_a_readable_directory_is_also_an_error(
+    tmp_path: Path,
+) -> None:
+    path = _write_secrets(tmp_path, {"a": "b"})
+    path.chmod(0o000)
+    try:
+        with pytest.raises(SecretsError, match="cannot be read"):
+            load_secrets(path)
+    finally:
+        path.chmod(0o600)
 
 
 def test_secrets_load_from_a_private_file(tmp_path: Path) -> None:
