@@ -6,7 +6,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "noti-mapper"
-version = "0.1.0"
+# Read from noti_mapper.VERSION rather than written here, so that the version
+# has one home. setuptools reads the attribute out of the source tree without
+# importing or installing anything, so this works during a build from a clean
+# checkout.
+dynamic = ["version"]
 description = "Latch notification events from inputs onto outputs until explicitly acknowledged."
 readme = "README.md"
 license = "MIT"
@@ -34,6 +38,9 @@ noti-mapper = "noti_mapper.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/gwoplock/noti-mapper"
+
+[tool.setuptools.dynamic]
+version = { attr = "noti_mapper.VERSION" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
