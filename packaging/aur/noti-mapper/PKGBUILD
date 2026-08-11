@@ -1,7 +1,7 @@
 # Maintainer: Garrett Battaglia
 
 pkgname=noti-mapper
-pkgver=0.1.0
+pkgver=0.0.2
 pkgrel=1
 pkgdesc="Latch notification events onto outputs until acknowledged"
 arch=('any')
