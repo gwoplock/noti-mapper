@@ -260,13 +260,47 @@ def _validate(paths: Paths) -> int:
     return EXIT_OK
 
 
+# -- reaching the state database ----------------------------------------------
+
+
+def database_problem(path: Path) -> str | None:
+    """Why the state database cannot be read, or None when it can.
+
+    "Not there" and "not allowed" are different answers and a caller must not
+    give one when it means the other. The state directory is mode 0750 owned by
+    the service user, so an administrator running ``noti-mapper status`` from
+    their own shell cannot search it -- and ``Path.exists()`` reports False for
+    a database that is right there and being written to as they ask. The reply
+    they got was "has the daemon ever run?", which is not merely vague: it
+    names a cause that is wrong, and sends someone to check on a daemon that is
+    running perfectly well.
+
+    This opens the file rather than asking ``os.access``, because the question
+    is whether this process can read this file now, and opening it is the only
+    thing that actually answers that.
+    """
+    try:
+        with path.open("rb"):
+            return None
+    except FileNotFoundError:
+        return f"no state database at {path}; has the daemon ever run?"
+    except PermissionError:
+        return (
+            f"cannot read {path}: Permission denied. The state directory belongs "
+            "to the user the daemon runs as; try again with sudo."
+        )
+    except OSError as error:
+        return f"cannot read {path}: {error.strerror}"
+
+
 # -- status -------------------------------------------------------------------
 
 
 def _status(paths: Paths) -> int:
     path = database_path(paths.state_directory)
-    if not path.exists():
-        print(f"noti-mapper: no state database at {path}; has the daemon ever run?")
+    problem = database_problem(path)
+    if problem is not None:
+        print(f"noti-mapper: {problem}")
         return EXIT_FAILURE
 
     database = Database(path=path)
@@ -420,8 +454,9 @@ def _rename(paths: Paths, *, old_name: str, new_name: str) -> int:
         return EXIT_FAILURE
 
     path = database_path(paths.state_directory)
-    if not path.exists():
-        print(f"noti-mapper: no state database at {path}", file=sys.stderr)
+    problem = database_problem(path)
+    if problem is not None:
+        print(f"noti-mapper: {problem}", file=sys.stderr)
         return EXIT_FAILURE
 
     database = Database(path=path)
@@ -451,8 +486,9 @@ def _rename(paths: Paths, *, old_name: str, new_name: str) -> int:
 
 def _purge(paths: Paths, *, assume_yes: bool) -> int:
     path = database_path(paths.state_directory)
-    if not path.exists():
-        print(f"noti-mapper: no state database at {path}", file=sys.stderr)
+    problem = database_problem(path)
+    if problem is not None:
+        print(f"noti-mapper: {problem}", file=sys.stderr)
         return EXIT_FAILURE
 
     database = Database(path=path)
