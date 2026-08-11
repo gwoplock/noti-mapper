@@ -19,6 +19,17 @@ from noti_mapper.jsonfile import JsonFileError, parse
 
 DEFAULT_SECRETS_PATH: Path = Path("/etc/noti-mapper/secrets.json")
 
+# Any access at all by "other", and write access by the group. Group *read* is
+# deliberately allowed, because the arrangement it permits is the better one:
+# root owns the file, the daemon's group reads it, and the daemon -- the thing
+# on the network, and so the thing that might be compromised -- cannot rewrite
+# its own credentials. Requiring 0600 forced the file to be owned by the daemon
+# user, which hands it exactly that write access.
+#
+# The group is the administrator's to choose. This can tell that a mode is
+# wrong; it cannot tell that a group is too broad.
+FORBIDDEN_MODE_BITS = 0o027
+
 # Secret names are not object names -- they never appear in the rule graph --
 # so they have their own, narrower character set.
 SECRET_NAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
@@ -54,7 +65,8 @@ def load_secrets(path: Path) -> SecretStore:
     A missing file is not an error -- most installations have no secrets. A
     file that any other user can read is an error, and it is reported loudly
     with the offending mode, because the whole point of the separate file is
-    that it carries different permissions.
+    that it carries different permissions. See :data:`FORBIDDEN_MODE_BITS` for
+    exactly which arrangements are allowed and why.
 
     A file that exists but cannot be read is a third case, and it must not be
     quietly folded into the first. ``Path.exists()`` answers False when the
@@ -84,10 +96,13 @@ def load_secrets(path: Path) -> SecretStore:
         ) from error
 
     mode = stat.S_IMODE(status.st_mode)
-    if mode & 0o077:
+    if mode & FORBIDDEN_MODE_BITS:
         raise SecretsError(
-            f"{path} is mode {mode:04o}, which is readable by group or other. "
-            f"Secrets must be mode 0600. Fix it with: chmod 0600 {path}"
+            f"{path} is mode {mode:04o}, which is readable by other users or "
+            "writable by its group. Use 0600 owned by the user the daemon runs "
+            "as, or 0640 owned by root with the daemon's group -- the second is "
+            f"better, since then the daemon cannot rewrite its own credentials. "
+            f"Fix it with: chmod 0640 {path}"
         )
 
     try:
