@@ -263,8 +263,25 @@ Substitution works inside a larger string, so
 
 Rules:
 
-- Mode `0600`, owned by the service user. The daemon **refuses to start** if the
-  file is group- or world-readable, and tells you the offending mode.
+- The daemon **refuses to start** if the file is readable by other users or
+  writable by its group, and tells you the offending mode. Two arrangements
+  work, and the first is better:
+
+  ```
+  install -m 0640 -o root -g noti-mapper secrets.json /etc/noti-mapper/
+  install -m 0600 -o noti-mapper -g noti-mapper secrets.json /etc/noti-mapper/
+  ```
+
+  Root owning the file means the daemon reads its credentials but cannot
+  rewrite them, and the daemon is the part of this system that talks to the
+  network. Note that only the *mode* can be checked from here: `0640` with a
+  group half the machine belongs to would pass, so pick the group deliberately.
+
+- The daemon must also be able to **search every directory above the file**.
+  This is why `/etc/noti-mapper` is `0755` and not `0750` — the service user is
+  in no group but its own, so a `root:root 0750` directory locks it out no
+  matter how the file inside is owned. If you tighten that directory, give it
+  to `root:noti-mapper`.
 - A referenced secret that does not exist is a configuration validation error,
   caught by `noti-mapper validate`, not a surprise at 3am.
 - Secret names may contain `A-Z a-z 0-9 _ . -`.
@@ -512,7 +529,7 @@ an ISP outage.
 | Path                                 | What                                    |
 | ------------------------------------ | --------------------------------------- |
 | `/etc/noti-mapper.d/*.json`          | Configuration.                          |
-| `/etc/noti-mapper/secrets.json`      | Secrets, mode 0600.                     |
+| `/etc/noti-mapper/secrets.json`      | Secrets, mode 0640 `root:noti-mapper`.  |
 | `/etc/noti-mapper/plugins/`          | Locally-authored plugins.               |
 | `/usr/lib/noti-mapper/plugins/`      | Packaged plugins.                       |
 | `/var/lib/noti-mapper/state.db`      | Latches, retries, plugin scratch, log.  |
