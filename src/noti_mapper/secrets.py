@@ -9,12 +9,13 @@ configuration files never contain secret material, which means they stay safe
 to paste into a GitHub issue.
 """
 
+import os
 import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from noti_mapper.jsonfile import JsonFileError, read_object
+from noti_mapper.jsonfile import JsonFileError, parse
 
 DEFAULT_SECRETS_PATH: Path = Path("/etc/noti-mapper/secrets.json")
 
@@ -54,11 +55,35 @@ def load_secrets(path: Path) -> SecretStore:
     file that any other user can read is an error, and it is reported loudly
     with the offending mode, because the whole point of the separate file is
     that it carries different permissions.
-    """
-    if not path.exists():
-        return empty_store(path)
 
-    mode = stat.S_IMODE(path.stat().st_mode)
+    A file that exists but cannot be read is a third case, and it must not be
+    quietly folded into the first. ``Path.exists()`` answers False when the
+    file is there but a directory above it is not searchable, so testing it
+    turns "you are not allowed to read this" into "you have no secrets" -- and
+    the user is then told every secret is undefined while looking straight at
+    the file that defines them all.
+
+    The file is opened once and the mode taken from that descriptor rather than
+    from a second look at the name. This is the one file in the system where it
+    is worth being sure that the thing whose permissions were approved is the
+    thing whose bytes were read. It is why this does not call
+    :func:`noti_mapper.jsonfile.read_object`, which opens by name.
+    """
+    try:
+        with path.open("rb") as handle:
+            status = os.fstat(handle.fileno())
+            raw = handle.read()
+    except FileNotFoundError:
+        return empty_store(path)
+    except OSError as error:
+        raise SecretsError(
+            f"{path}: cannot be read: {error.strerror}. The file is there, so this "
+            "is a permissions problem rather than a missing file: reaching it needs "
+            "search permission on every directory above it as well as read "
+            "permission on the file itself."
+        ) from error
+
+    mode = stat.S_IMODE(status.st_mode)
     if mode & 0o077:
         raise SecretsError(
             f"{path} is mode {mode:04o}, which is readable by group or other. "
@@ -66,9 +91,17 @@ def load_secrets(path: Path) -> SecretStore:
         )
 
     try:
-        document = read_object(path)
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SecretsError(f"{path}: is not valid UTF-8: {error}") from error
+
+    try:
+        document = parse(text=text, path=path)
     except JsonFileError as error:
         raise SecretsError(f"{error}") from error
+
+    if not isinstance(document, dict):
+        raise SecretsError(f"{path}: the top level must be an object")
 
     values: dict[str, str] = {}
     for name, value in document.items():
