@@ -1,5 +1,6 @@
 import datetime
 import json
+import os
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -207,6 +208,39 @@ def test_status_without_a_database_says_so(
 ) -> None:
     assert main(_argv(workspace, "status")) == EXIT_FAILURE
     assert "has the daemon ever run" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+@pytest.mark.parametrize(
+    ("command", "stream"),
+    [(("status",), "out"), (("rename", "A", "B"), "err"), (("purge", "--yes"), "err")],
+)
+def test_an_unreadable_database_is_not_reported_as_a_missing_one(
+    workspace: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+    command: tuple[str, ...],
+    stream: str,
+) -> None:
+    """The state directory is 0750 owned by the service user.
+
+    An administrator running this from their own shell cannot search it, and
+    the old answer -- "has the daemon ever run?" -- named a cause that was
+    wrong while the daemon was running and writing to the very file.
+    """
+    _valid_config(workspace)
+    state = workspace["state"]
+    database_path(state).write_bytes(b"")
+    state.chmod(0o000)
+    try:
+        assert main(_argv(workspace, *command)) == EXIT_FAILURE
+        captured = capsys.readouterr()
+    finally:
+        state.chmod(0o755)
+
+    output = captured.out if stream == "out" else captured.err
+    assert "Permission denied" in output
+    assert "sudo" in output
+    assert "has the daemon ever run" not in output
 
 
 def test_status_prints_latches_outputs_and_events(
