@@ -6,7 +6,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "noti-mapper"
-version = "0.1.0"
+# Read from noti_mapper.VERSION rather than written here, so that the version
+# has one home. setuptools reads the attribute out of the source tree without
+# importing or installing anything, so this works during a build from a clean
+# checkout.
+dynamic = ["version"]
 description = "Latch notification events from inputs onto outputs until explicitly acknowledged."
 readme = "README.md"
 license = "MIT"
@@ -35,6 +39,9 @@ noti-mapper = "noti_mapper.cli:main"
 [project.urls]
 Homepage = "https://github.com/gwoplock/noti-mapper"
 
+[tool.setuptools.dynamic]
+version = { attr = "noti_mapper.VERSION" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
@@ -45,7 +52,9 @@ target-version = ["py311"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["src", "plugins", "tests"]
+# "." so that "scripts.stamp_version" resolves as first-party rather than
+# being sorted in with the third-party imports.
+src = ["src", "plugins", "tests", "."]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RET", "ARG", "PTH", "TID"]
@@ -71,7 +80,7 @@ strict = true
 warn_unreachable = true
 disallow_any_unimported = true
 mypy_path = "src"
-files = ["src", "tests", "plugins"]
+files = ["src", "tests", "plugins", "scripts"]
 
 [[tool.mypy.overrides]]
 # behave ships no type information.
