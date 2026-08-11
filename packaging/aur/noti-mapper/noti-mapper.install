@@ -8,8 +8,14 @@ noti-mapper is installed but not configured. Nothing is watched yet.
   1. Copy the examples from /usr/share/doc/noti-mapper/examples/ into
      /etc/noti-mapper.d/ and edit them. They are not live where they are.
 
-  2. If you use secrets, put them in /etc/noti-mapper/secrets.json, mode 0600,
-     owned by the noti-mapper user. The daemon refuses to start otherwise.
+  2. If you use secrets, put them in /etc/noti-mapper/secrets.json. The daemon
+     reads it as the noti-mapper user and refuses to start if anyone else can
+     read it, so:
+
+       install -m 0640 -o root -g noti-mapper secrets.json /etc/noti-mapper/
+
+     Root owns it and the daemon only reads it, so a compromised daemon cannot
+     rewrite its own credentials. 0600 owned by noti-mapper also works.
 
   3. Check your work:      noti-mapper validate
   4. Then:                 systemctl enable --now noti-mapper

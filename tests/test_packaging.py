@@ -18,6 +18,7 @@ import pytest
 from noti_mapper import VERSION
 from noti_mapper.cli import EXIT_OK, SUBCOMMANDS, build_parser, main, subcommand_names
 from noti_mapper.discovery import source_checkout_plugin_directory
+from noti_mapper.secrets import FORBIDDEN_MODE_BITS
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DIST = REPOSITORY_ROOT / "dist"
@@ -25,6 +26,7 @@ EXAMPLES = DIST / "examples"
 UNIT = DIST / "noti-mapper.service"
 SYSUSERS = DIST / "noti-mapper.sysusers"
 PKGBUILD = REPOSITORY_ROOT / "packaging" / "aur" / "noti-mapper" / "PKGBUILD"
+SCRIPTLET = REPOSITORY_ROOT / "packaging" / "aur" / "noti-mapper" / "noti-mapper.install"
 
 
 @pytest.fixture(autouse=True)
@@ -248,10 +250,44 @@ def test_every_shipped_plugin_directory_looks_installable() -> None:
 
 
 def test_the_example_secrets_file_is_not_shipped_world_readable_by_accident() -> None:
-    """The file in the repository is a template; the docs say to install it 0600."""
+    """The file in the repository is a template; the docs say how to install it."""
     mode = stat.S_IMODE((EXAMPLES / "secrets.json").stat().st_mode)
     assert mode & 0o111 == 0, "a JSON template should not be executable"
-    assert "0600" in (EXAMPLES / "README.md").read_text(encoding="utf-8")
+    readme = (EXAMPLES / "README.md").read_text(encoding="utf-8")
+    assert "0640" in readme or "0600" in readme
+
+
+def test_the_secrets_directory_is_searchable_by_the_daemon_user() -> None:
+    """The bug this pins: /etc/noti-mapper shipped 0750 root:root.
+
+    The daemon runs as noti-mapper, which is in no group but its own, so it
+    could not search the directory and could not open secrets.json however the
+    file itself was owned. Every install hit this on first start.
+
+    The package cannot chown to a group that need not exist while it is built,
+    so the directory is 0755 and the secret is protected by the file's mode --
+    the arrangement /etc/ssh uses.
+    """
+    text = PKGBUILD.read_text(encoding="utf-8")
+    match = re.search(r'install -dm(\d+) "\$\{pkgdir\}/etc/\$\{pkgname\}"', text)
+    assert match is not None, "the PKGBUILD no longer creates /etc/noti-mapper"
+
+    mode = int(match.group(1), 8)
+    assert mode & 0o001, f"/etc/noti-mapper is mode {mode:04o}; the daemon cannot search it"
+
+
+def test_the_install_message_gives_a_secrets_command_the_daemon_will_accept() -> None:
+    """A first-run instruction that produces a daemon that will not start is worse
+    than none, so the mode it recommends has to pass the loader's own check."""
+    text = SCRIPTLET.read_text(encoding="utf-8")
+    match = re.search(r"install -m 0(\d+) -o (\S+) -g (\S+) secrets\.json", text)
+    assert match is not None, "the install message no longer shows how to place secrets"
+
+    mode = int(match.group(1), 8)
+    assert (
+        mode & FORBIDDEN_MODE_BITS == 0
+    ), f"the message recommends mode {mode:04o}, which is refused"
+    assert match.group(3) == "noti-mapper", "the group has to be one the daemon is in"
 
 
 # -- the prose docs -----------------------------------------------------------

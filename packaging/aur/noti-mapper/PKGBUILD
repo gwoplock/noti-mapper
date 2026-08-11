@@ -86,6 +86,17 @@ package() {
 
   # The .d directory is created by the unit's ConfigurationDirectory=; this one
   # is not, and is where secrets.json goes.
-  install -dm750 "${pkgdir}/etc/${pkgname}"
+  #
+  # 0755 and not 0750. The daemon runs as the noti-mapper user, which is in no
+  # group but its own, so a directory owned root:root can only be searched by
+  # that user if other has execute -- and without search permission the daemon
+  # cannot open secrets.json no matter how the file itself is owned. Giving the
+  # directory to root:noti-mapper instead would need the group to exist while
+  # the package is built, which it need not.
+  #
+  # Nothing is given away by this. The directory listing is not a secret; the
+  # secret is in the file, protected by the file's own mode. /etc/ssh is 0755
+  # for the same reason and holds 0600 host keys.
+  install -dm755 "${pkgdir}/etc/${pkgname}"
   install -dm755 "${pkgdir}/etc/${pkgname}/plugins"
 }

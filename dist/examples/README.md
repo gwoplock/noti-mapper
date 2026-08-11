@@ -10,7 +10,7 @@ Copy what you want into place instead:
 ```
 install -m 0644 /usr/share/doc/noti-mapper/examples/10-instances.json /etc/noti-mapper.d/
 install -m 0644 /usr/share/doc/noti-mapper/examples/20-rules.json     /etc/noti-mapper.d/
-install -m 0600 -o noti-mapper -g noti-mapper \
+install -m 0640 -o root -g noti-mapper \
     /usr/share/doc/noti-mapper/examples/secrets.json /etc/noti-mapper/secrets.json
 ```
 
@@ -26,7 +26,9 @@ and log what it *would* have done without emitting anything, which is how you
 find out that your carrier also sends "Out for delivery" twice a day.
 
 `secrets.json` lives outside `/etc/noti-mapper.d/` deliberately, so that it is
-not swept up by configuration merging and can carry mode 0600. The daemon
-refuses to start if it is group- or world-readable. Because secrets never
-appear in the configuration files themselves, those files stay safe to paste
-into a bug report.
+not swept up by configuration merging and can carry its own permissions. Root
+owns it and the daemon's group reads it, which means a compromised daemon
+cannot rewrite its own credentials; mode 0600 owned by `noti-mapper` works too.
+The daemon refuses to start if the file is readable by other users or writable
+by its group. Because secrets never appear in the configuration files
+themselves, those files stay safe to paste into a bug report.
