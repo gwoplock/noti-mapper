@@ -19,6 +19,7 @@ from noti_mapper import VERSION
 from noti_mapper.cli import EXIT_OK, SUBCOMMANDS, build_parser, main, subcommand_names
 from noti_mapper.discovery import source_checkout_plugin_directory
 from noti_mapper.secrets import FORBIDDEN_MODE_BITS
+from scripts.stamp_version import STAMPS, drift
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DIST = REPOSITORY_ROOT / "dist"
@@ -197,17 +198,58 @@ def test_the_rename_warning_is_prominent_in_the_config_page() -> None:
     assert rules_index < warning_index < daemon_index
 
 
-def test_the_man_pages_carry_the_current_version() -> None:
-    for name in ("noti-mapper.1", "noti-mapper.d.5"):
-        page = (DIST / "man" / name).read_text(encoding="utf-8")
-        assert f"noti-mapper {VERSION}" in page
+def test_every_copy_of_the_version_agrees_with_the_package() -> None:
+    """The man pages and the PKGBUILD hold copies; they have to say the same thing.
+
+    This replaced two assertions of the shape ``f"pkgver={VERSION}" in
+    PKGBUILD.read_text()``. They were correct and nearly useless: on failure
+    pytest printed the whole file twice to report that two short strings
+    differed, and said nothing about which of the four copies was wrong or what
+    to do about it. The check is worth keeping; that presentation of it was
+    not.
+    """
+    problems = drift(VERSION)
+    assert not problems, "\n".join(
+        [
+            "",
+            *problems,
+            "",
+            f"noti_mapper.VERSION is {VERSION}. If that is the version you want, run:",
+            "    python scripts/stamp_version.py",
+            "Otherwise set it in src/noti_mapper/__init__.py and run that.",
+        ]
+    )
+
+
+def test_the_stamper_knows_where_every_copy_lives() -> None:
+    """A stamp whose pattern no longer matches would silently stop stamping.
+
+    ``drift`` reports a missing pattern as a problem rather than as agreement,
+    so this is really checking that the previous test cannot pass vacuously.
+    """
+    for entry in STAMPS:
+        text = entry.path.read_text(encoding="utf-8")
+        assert entry.current(text) is not None, f"{entry.path} no longer matches its pattern"
+
+
+def test_stamping_is_idempotent_and_reversible() -> None:
+    """Stamping the version that is already there changes nothing at all.
+
+    A stamper that rewrites files it did not need to touch turns every release
+    into a diff nobody can read.
+    """
+    for entry in STAMPS:
+        original = entry.path.read_text(encoding="utf-8")
+        assert entry.applied(original, VERSION) == original
+
+        moved = entry.applied(original, "9.9.9")
+        assert moved != original
+        assert entry.current(moved) == "9.9.9"
+        # And back, byte for byte.
+        assert entry.applied(moved, VERSION) == original
 
 
 # -- the PKGBUILD -------------------------------------------------------------
-
-
-def test_the_pkgbuild_version_matches_the_package() -> None:
-    assert f"pkgver={VERSION}" in PKGBUILD.read_text(encoding="utf-8")
 
 
 def test_the_pkgbuild_declares_the_libraries_the_plugins_import() -> None:
