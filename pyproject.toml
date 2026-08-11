@@ -78,7 +78,7 @@ strict = true
 warn_unreachable = true
 disallow_any_unimported = true
 mypy_path = "src"
-files = ["src", "tests", "plugins"]
+files = ["src", "tests", "plugins", "scripts"]
 
 [[tool.mypy.overrides]]
 # behave ships no type information.
